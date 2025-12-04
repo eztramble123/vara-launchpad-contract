@@ -84,3 +84,4 @@ Licensed under either of:
 
 Contributions are welcome! Please read our contributing guidelines before submitting PRs.
 # vara-contract-templates
+# vara-launchpad-contract
