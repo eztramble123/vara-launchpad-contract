@@ -1,0 +1,16 @@
+[package]
+name = "launchpad-app"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+sails-rs.workspace = true
+gstd.workspace = true
+parity-scale-codec.workspace = true
+scale-info.workspace = true
+vara-contracts-shared.workspace = true
+
+[dev-dependencies]
+gtest.workspace = true
+tokio.workspace = true

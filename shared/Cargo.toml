@@ -1,0 +1,11 @@
+[package]
+name = "vara-contracts-shared"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+sails-rs.workspace = true
+parity-scale-codec.workspace = true
+scale-info.workspace = true
+gstd.workspace = true

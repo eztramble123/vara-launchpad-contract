@@ -1,0 +1,23 @@
+# Generated files
+target/
+*.wasm
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Cargo
+Cargo.lock
+
+# Environment
+.env
+.env.local
+
+# Test artifacts
+*.log
