@@ -1,33 +1,115 @@
-//! Integration tests for Launchpad contract.
+//! Integration tests for Launchpad v2 contract.
 
 use gtest::{Program, System};
-use sails_rs::prelude::*;
+use launchpad_app::CreateLaunchInput;
+use sails_rs::prelude::ActorId;
+use sails_rs::Encode;
 
-const OWNER: u64 = 1;
-const CREATOR: u64 = 2;
-const CONTRIBUTOR1: u64 = 3;
-const CONTRIBUTOR2: u64 = 4;
-const NON_WHITELISTED: u64 = 5;
-const ANYONE: u64 = 6;
+// User IDs must be >= 100 to be valid in gtest
+const OWNER: u64 = 100;
+const CREATOR: u64 = 101;
+const CONTRIBUTOR1: u64 = 102;
+const CONTRIBUTOR2: u64 = 103;
+const NON_WHITELISTED: u64 = 104;
+const ANYONE: u64 = 105;
 
 const ONE_VARA: u128 = 1_000_000_000_000; // 10^12
+const EXISTENTIAL_DEPOSIT: u128 = 10 * ONE_VARA;
+
+// Token address (dummy for testing)
+const TOKEN_ADDRESS: u64 = 200;
+
+/// Encode a Sails constructor name
+fn encode_constructor(name: &str) -> Vec<u8> {
+    name.encode()
+}
+
+/// Encode a Sails service call with parameters
+fn encode_call<T: Encode>(service: &str, method: &str, params: T) -> Vec<u8> {
+    let mut payload = Vec::new();
+    payload.extend(service.encode());
+    payload.extend(method.encode());
+    payload.extend(params.encode());
+    payload
+}
+
+/// Encode a Sails service call without parameters
+fn encode_call_no_params(service: &str, method: &str) -> Vec<u8> {
+    let mut payload = Vec::new();
+    payload.extend(service.encode());
+    payload.extend(method.encode());
+    payload
+}
 
 fn setup_system() -> System {
     let system = System::new();
     system.init_logger();
+
+    // Mint balances for all test users
+    system.mint_to(OWNER, EXISTENTIAL_DEPOSIT * 1000);
+    system.mint_to(CREATOR, EXISTENTIAL_DEPOSIT * 1000);
+    system.mint_to(CONTRIBUTOR1, EXISTENTIAL_DEPOSIT * 1000);
+    system.mint_to(CONTRIBUTOR2, EXISTENTIAL_DEPOSIT * 1000);
+    system.mint_to(NON_WHITELISTED, EXISTENTIAL_DEPOSIT * 1000);
+    system.mint_to(ANYONE, EXISTENTIAL_DEPOSIT * 1000);
+
     system
 }
 
 fn deploy_contract(system: &System) -> Program<'_> {
     let program = Program::from_file(
         system,
-        "../target/wasm32-unknown-unknown/release/launchpad.opt.wasm",
+        "../../target/wasm32-gear/release/launchpad.opt.wasm",
     );
 
     // Initialize with OWNER as the deployer (default 2% fee)
-    let _result = program.send_bytes(OWNER, b"New");
+    let init_payload = encode_constructor("New");
+    let init_msg_id = program.send_bytes(OWNER, init_payload);
+    let result = system.run_next_block();
+
+    if !result.succeed.contains(&init_msg_id) {
+        panic!("Contract init failed. Check WASM file exists and is valid.");
+    }
 
     program
+}
+
+/// Create a standard launch input for testing
+fn create_test_launch_input(system: &System) -> CreateLaunchInput {
+    let current_block = system.block_height();
+
+    CreateLaunchInput {
+        title: "Test Token Launch".into(),
+        description: "A test token launch for integration testing".into(),
+        token_address: ActorId::from(TOKEN_ADDRESS),
+        total_tokens: 1_000_000 * ONE_VARA,
+        price_per_token: ONE_VARA / 1000, // 0.001 VARA per token
+        min_raise: 100 * ONE_VARA,
+        max_raise: 1000 * ONE_VARA,
+        max_per_wallet: 200 * ONE_VARA,
+        start_time: current_block + 10,
+        end_time: current_block + 10000,
+        whitelist_enabled: false,
+        vesting_config: None,
+    }
+}
+
+/// Advance blocks to simulate time passing
+fn advance_blocks(system: &System, count: u32) {
+    for _ in 0..count {
+        system.run_next_block();
+    }
+}
+
+// =============================================================================
+// BASIC TESTS
+// =============================================================================
+
+#[test]
+fn test_contract_initialization() {
+    let system = setup_system();
+    let _program = deploy_contract(&system);
+    // If we get here, initialization succeeded
 }
 
 #[test]
@@ -35,90 +117,130 @@ fn test_create_launch() {
     let system = setup_system();
     let program = deploy_contract(&system);
 
-    // Create a launch
-    let result = program.send_bytes(
-        CREATOR,
-        b"Launchpad\x00CreateLaunch",
-    );
+    let input = create_test_launch_input(&system);
+    let payload = encode_call("Launchpad", "CreateLaunch", input);
 
-    assert!(!result.main_failed(), "Creating launch should succeed");
+    let msg_id = program.send_bytes(CREATOR, payload);
+    let result = system.run_next_block();
+
+    assert!(
+        result.succeed.contains(&msg_id),
+        "CreateLaunch should succeed"
+    );
 }
 
 #[test]
-fn test_contribute_within_limits() {
+fn test_start_launch() {
     let system = setup_system();
     let program = deploy_contract(&system);
 
-    // Create a launch
-    let _ = program.send_bytes(
-        CREATOR,
-        b"Launchpad\x00CreateLaunch",
-    );
+    // Create launch
+    let input = create_test_launch_input(&system);
+    let msg_id = program.send_bytes(CREATOR, encode_call("Launchpad", "CreateLaunch", input));
+    let result = system.run_next_block();
+    assert!(result.succeed.contains(&msg_id));
 
-    // Start the launch
-    let _ = program.send_bytes(
-        CREATOR,
-        b"Launchpad\x00StartLaunch",
+    // Start launch (launch_id = 0)
+    let launch_id: u64 = 0;
+    let msg_id = program.send_bytes(CREATOR, encode_call("Launchpad", "StartLaunch", launch_id));
+    let result = system.run_next_block();
+
+    assert!(
+        result.succeed.contains(&msg_id),
+        "StartLaunch should succeed"
     );
+}
+
+#[test]
+fn test_contribute() {
+    let system = setup_system();
+    let program = deploy_contract(&system);
+
+    // Create and start launch
+    let input = create_test_launch_input(&system);
+    program.send_bytes(CREATOR, encode_call("Launchpad", "CreateLaunch", input));
+    system.run_next_block();
+
+    let launch_id: u64 = 0;
+    program.send_bytes(CREATOR, encode_call("Launchpad", "StartLaunch", launch_id));
+    system.run_next_block();
 
     // Advance to start time
-    system.spend_blocks(1000);
+    advance_blocks(&system, 15);
 
-    // Contribute within limits
-    system.mint_to(CONTRIBUTOR1, 1000 * ONE_VARA);
-
-    let result = program.send_bytes_with_value(
+    // Contribute
+    let msg_id = program.send_bytes_with_value(
         CONTRIBUTOR1,
-        b"Launchpad\x00Contribute",
+        encode_call("Launchpad", "Contribute", launch_id),
         50 * ONE_VARA,
     );
+    let result = system.run_next_block();
 
-    assert!(!result.main_failed(), "Contributing within limits should succeed");
+    assert!(
+        result.succeed.contains(&msg_id),
+        "Contribute should succeed"
+    );
 }
 
 #[test]
-fn test_whitelist_enforcement() {
+fn test_whitelist_functionality() {
     let system = setup_system();
     let program = deploy_contract(&system);
 
-    // Create a launch with whitelist enabled
-    let _ = program.send_bytes(
-        CREATOR,
-        b"Launchpad\x00CreateLaunch", // whitelist_enabled: true
-    );
+    // Create launch with whitelist enabled
+    let mut input = create_test_launch_input(&system);
+    input.whitelist_enabled = true;
+
+    program.send_bytes(CREATOR, encode_call("Launchpad", "CreateLaunch", input));
+    system.run_next_block();
+
+    let launch_id: u64 = 0;
 
     // Add CONTRIBUTOR1 to whitelist
-    let _ = program.send_bytes(
+    let addresses: Vec<ActorId> = vec![ActorId::from(CONTRIBUTOR1)];
+    let msg_id = program.send_bytes(
         CREATOR,
-        b"Launchpad\x00AddToWhitelist",
+        encode_call("Launchpad", "AddToWhitelist", (launch_id, addresses)),
+    );
+    let result = system.run_next_block();
+
+    assert!(
+        result.succeed.contains(&msg_id),
+        "AddToWhitelist should succeed"
     );
 
-    // Start the launch
-    let _ = program.send_bytes(
-        CREATOR,
-        b"Launchpad\x00StartLaunch",
-    );
+    // Start launch
+    program.send_bytes(CREATOR, encode_call("Launchpad", "StartLaunch", launch_id));
+    system.run_next_block();
 
     // Advance to start time
-    system.spend_blocks(1000);
+    advance_blocks(&system, 15);
 
     // Whitelisted user can contribute
-    system.mint_to(CONTRIBUTOR1, 1000 * ONE_VARA);
-    let result1 = program.send_bytes_with_value(
+    let msg_id = program.send_bytes_with_value(
         CONTRIBUTOR1,
-        b"Launchpad\x00Contribute",
+        encode_call("Launchpad", "Contribute", launch_id),
         50 * ONE_VARA,
     );
-    assert!(!result1.main_failed(), "Whitelisted contributor should succeed");
+    let result = system.run_next_block();
+
+    assert!(
+        result.succeed.contains(&msg_id),
+        "Whitelisted contributor should succeed"
+    );
 
     // Non-whitelisted user should fail
-    system.mint_to(NON_WHITELISTED, 1000 * ONE_VARA);
-    let result2 = program.send_bytes_with_value(
+    let msg_id = program.send_bytes_with_value(
         NON_WHITELISTED,
-        b"Launchpad\x00Contribute",
+        encode_call("Launchpad", "Contribute", launch_id),
         50 * ONE_VARA,
     );
-    // Should fail - not whitelisted
+    let result = system.run_next_block();
+
+    assert!(
+        result.failed.contains(&msg_id),
+        "Non-whitelisted contributor should fail"
+    );
 }
 
 #[test]
@@ -126,216 +248,167 @@ fn test_finalize_successful_launch() {
     let system = setup_system();
     let program = deploy_contract(&system);
 
-    // Create and start launch
-    let _ = program.send_bytes(CREATOR, b"Launchpad\x00CreateLaunch");
-    let _ = program.send_bytes(CREATOR, b"Launchpad\x00StartLaunch");
+    // Create launch with low min_raise
+    let mut input = create_test_launch_input(&system);
+    input.min_raise = 50 * ONE_VARA;
+
+    program.send_bytes(CREATOR, encode_call("Launchpad", "CreateLaunch", input));
+    system.run_next_block();
+
+    let launch_id: u64 = 0;
+    program.send_bytes(CREATOR, encode_call("Launchpad", "StartLaunch", launch_id));
+    system.run_next_block();
 
     // Advance to start time
-    system.spend_blocks(1000);
+    advance_blocks(&system, 15);
 
-    // Contributors meet minimum raise
-    system.mint_to(CONTRIBUTOR1, 1000 * ONE_VARA);
-    system.mint_to(CONTRIBUTOR2, 1000 * ONE_VARA);
-
-    let _ = program.send_bytes_with_value(
+    // Contribute enough to meet min_raise
+    program.send_bytes_with_value(
         CONTRIBUTOR1,
-        b"Launchpad\x00Contribute",
-        300 * ONE_VARA,
+        encode_call("Launchpad", "Contribute", launch_id),
+        100 * ONE_VARA,
     );
-    let _ = program.send_bytes_with_value(
-        CONTRIBUTOR2,
-        b"Launchpad\x00Contribute",
-        300 * ONE_VARA,
-    );
+    system.run_next_block();
 
     // Advance past end time
-    system.spend_blocks(10000);
+    advance_blocks(&system, 10000);
 
-    // Finalize launch
-    let result = program.send_bytes(
-        ANYONE,
-        b"Launchpad\x00Finalize",
+    // Finalize
+    let msg_id = program.send_bytes(ANYONE, encode_call("Launchpad", "Finalize", launch_id));
+    let result = system.run_next_block();
+
+    assert!(
+        result.succeed.contains(&msg_id),
+        "Finalize should succeed for successful launch"
     );
-
-    assert!(!result.main_failed(), "Finalizing successful launch should succeed");
 }
 
 #[test]
-fn test_claim_tokens() {
+fn test_finalize_failed_launch() {
     let system = setup_system();
     let program = deploy_contract(&system);
 
-    // Create, start, fund, and finalize launch
-    let _ = program.send_bytes(CREATOR, b"Launchpad\x00CreateLaunch");
-    let _ = program.send_bytes(CREATOR, b"Launchpad\x00StartLaunch");
+    // Create launch with high min_raise
+    let mut input = create_test_launch_input(&system);
+    input.min_raise = 500 * ONE_VARA;
 
-    system.spend_blocks(1000);
+    program.send_bytes(CREATOR, encode_call("Launchpad", "CreateLaunch", input));
+    system.run_next_block();
 
-    system.mint_to(CONTRIBUTOR1, 1000 * ONE_VARA);
-    let _ = program.send_bytes_with_value(
+    let launch_id: u64 = 0;
+    program.send_bytes(CREATOR, encode_call("Launchpad", "StartLaunch", launch_id));
+    system.run_next_block();
+
+    // Advance to start time
+    advance_blocks(&system, 15);
+
+    // Contribute less than min_raise
+    program.send_bytes_with_value(
         CONTRIBUTOR1,
-        b"Launchpad\x00Contribute",
-        500 * ONE_VARA,
+        encode_call("Launchpad", "Contribute", launch_id),
+        50 * ONE_VARA,
     );
+    system.run_next_block();
 
-    system.spend_blocks(10000);
-    let _ = program.send_bytes(ANYONE, b"Launchpad\x00Finalize");
+    // Advance past end time
+    advance_blocks(&system, 10000);
 
-    // Claim tokens
-    let result = program.send_bytes(
-        CONTRIBUTOR1,
-        b"Launchpad\x00ClaimTokens",
+    // Finalize - should mark as failed
+    let msg_id = program.send_bytes(ANYONE, encode_call("Launchpad", "Finalize", launch_id));
+    let result = system.run_next_block();
+
+    assert!(
+        result.succeed.contains(&msg_id),
+        "Finalize should succeed (marking launch as failed)"
     );
-
-    assert!(!result.main_failed(), "Claiming tokens should succeed");
 }
 
 #[test]
-fn test_refund_failed_launch() {
+fn test_claim_refund() {
     let system = setup_system();
     let program = deploy_contract(&system);
 
-    // Create and start launch
-    let _ = program.send_bytes(CREATOR, b"Launchpad\x00CreateLaunch");
-    let _ = program.send_bytes(CREATOR, b"Launchpad\x00StartLaunch");
+    // Create launch with high min_raise (will fail)
+    let mut input = create_test_launch_input(&system);
+    input.min_raise = 500 * ONE_VARA;
 
-    system.spend_blocks(1000);
+    program.send_bytes(CREATOR, encode_call("Launchpad", "CreateLaunch", input));
+    system.run_next_block();
 
-    // Contribute less than minimum
-    system.mint_to(CONTRIBUTOR1, 1000 * ONE_VARA);
-    let _ = program.send_bytes_with_value(
+    let launch_id: u64 = 0;
+    program.send_bytes(CREATOR, encode_call("Launchpad", "StartLaunch", launch_id));
+    system.run_next_block();
+
+    advance_blocks(&system, 15);
+
+    // Contribute
+    program.send_bytes_with_value(
         CONTRIBUTOR1,
-        b"Launchpad\x00Contribute",
-        50 * ONE_VARA, // Less than min_raise
+        encode_call("Launchpad", "Contribute", launch_id),
+        50 * ONE_VARA,
     );
+    system.run_next_block();
 
-    // Advance past end time
-    system.spend_blocks(10000);
-
-    // Finalize - should fail due to min raise not met
-    let _ = program.send_bytes(ANYONE, b"Launchpad\x00Finalize");
+    // Advance past end time and finalize
+    advance_blocks(&system, 10000);
+    program.send_bytes(ANYONE, encode_call("Launchpad", "Finalize", launch_id));
+    system.run_next_block();
 
     // Claim refund
-    let result = program.send_bytes(
+    let msg_id = program.send_bytes(
         CONTRIBUTOR1,
-        b"Launchpad\x00ClaimRefund",
+        encode_call("Launchpad", "ClaimRefund", launch_id),
     );
+    let result = system.run_next_block();
 
-    assert!(!result.main_failed(), "Claiming refund should succeed");
+    assert!(
+        result.succeed.contains(&msg_id),
+        "ClaimRefund should succeed for failed launch"
+    );
 }
 
 #[test]
-fn test_max_per_wallet_limit() {
+fn test_withdraw_funds() {
     let system = setup_system();
     let program = deploy_contract(&system);
 
-    // Create and start launch with max_per_wallet limit
-    let _ = program.send_bytes(CREATOR, b"Launchpad\x00CreateLaunch");
-    let _ = program.send_bytes(CREATOR, b"Launchpad\x00StartLaunch");
+    // Create launch with low min_raise
+    let mut input = create_test_launch_input(&system);
+    input.min_raise = 50 * ONE_VARA;
 
-    system.spend_blocks(1000);
+    program.send_bytes(CREATOR, encode_call("Launchpad", "CreateLaunch", input));
+    system.run_next_block();
 
-    // First contribution within limit
-    system.mint_to(CONTRIBUTOR1, 1000 * ONE_VARA);
-    let result1 = program.send_bytes_with_value(
+    let launch_id: u64 = 0;
+    program.send_bytes(CREATOR, encode_call("Launchpad", "StartLaunch", launch_id));
+    system.run_next_block();
+
+    advance_blocks(&system, 15);
+
+    // Contribute enough
+    program.send_bytes_with_value(
         CONTRIBUTOR1,
-        b"Launchpad\x00Contribute",
-        50 * ONE_VARA,
+        encode_call("Launchpad", "Contribute", launch_id),
+        100 * ONE_VARA,
     );
-    assert!(!result1.main_failed(), "First contribution should succeed");
+    system.run_next_block();
 
-    // Second contribution that would exceed limit
-    // (behavior depends on implementation - may cap or reject)
-}
-
-#[test]
-fn test_contribute_outside_time_window() {
-    let system = setup_system();
-    let program = deploy_contract(&system);
-
-    // Create and start launch
-    let _ = program.send_bytes(CREATOR, b"Launchpad\x00CreateLaunch");
-    let _ = program.send_bytes(CREATOR, b"Launchpad\x00StartLaunch");
-
-    // Don't advance blocks - still before start time
-    system.mint_to(CONTRIBUTOR1, 1000 * ONE_VARA);
-    let result = program.send_bytes_with_value(
-        CONTRIBUTOR1,
-        b"Launchpad\x00Contribute",
-        50 * ONE_VARA,
-    );
-
-    // Should fail - outside time window
-}
-
-#[test]
-fn test_withdraw_funds_after_success() {
-    let system = setup_system();
-    let program = deploy_contract(&system);
-
-    // Create, start, fund, and finalize launch
-    let _ = program.send_bytes(CREATOR, b"Launchpad\x00CreateLaunch");
-    let _ = program.send_bytes(CREATOR, b"Launchpad\x00StartLaunch");
-
-    system.spend_blocks(1000);
-
-    system.mint_to(CONTRIBUTOR1, 1000 * ONE_VARA);
-    let _ = program.send_bytes_with_value(
-        CONTRIBUTOR1,
-        b"Launchpad\x00Contribute",
-        600 * ONE_VARA,
-    );
-
-    system.spend_blocks(10000);
-    let _ = program.send_bytes(ANYONE, b"Launchpad\x00Finalize");
+    // Advance and finalize
+    advance_blocks(&system, 10000);
+    program.send_bytes(ANYONE, encode_call("Launchpad", "Finalize", launch_id));
+    system.run_next_block();
 
     // Creator withdraws funds
-    let result = program.send_bytes(
+    let msg_id = program.send_bytes(
         CREATOR,
-        b"Launchpad\x00WithdrawFunds",
+        encode_call("Launchpad", "WithdrawFunds", launch_id),
     );
+    let result = system.run_next_block();
 
-    assert!(!result.main_failed(), "Withdrawing funds should succeed");
-}
-
-#[test]
-fn test_cancel_launch() {
-    let system = setup_system();
-    let program = deploy_contract(&system);
-
-    // Create a launch (still pending)
-    let _ = program.send_bytes(
-        CREATOR,
-        b"Launchpad\x00CreateLaunch",
+    assert!(
+        result.succeed.contains(&msg_id),
+        "WithdrawFunds should succeed for creator"
     );
-
-    // Cancel before starting
-    let result = program.send_bytes(
-        CREATOR,
-        b"Launchpad\x00CancelLaunch",
-    );
-
-    assert!(!result.main_failed(), "Cancelling launch should succeed");
-}
-
-#[test]
-fn test_add_to_whitelist() {
-    let system = setup_system();
-    let program = deploy_contract(&system);
-
-    // Create a launch
-    let _ = program.send_bytes(
-        CREATOR,
-        b"Launchpad\x00CreateLaunch",
-    );
-
-    // Add addresses to whitelist
-    let result = program.send_bytes(
-        CREATOR,
-        b"Launchpad\x00AddToWhitelist",
-    );
-
-    assert!(!result.main_failed(), "Adding to whitelist should succeed");
 }
 
 #[test]
@@ -343,60 +416,142 @@ fn test_unauthorized_withdraw_fails() {
     let system = setup_system();
     let program = deploy_contract(&system);
 
-    // Create, start, fund, and finalize
-    let _ = program.send_bytes(CREATOR, b"Launchpad\x00CreateLaunch");
-    let _ = program.send_bytes(CREATOR, b"Launchpad\x00StartLaunch");
+    let mut input = create_test_launch_input(&system);
+    input.min_raise = 50 * ONE_VARA;
 
-    system.spend_blocks(1000);
+    program.send_bytes(CREATOR, encode_call("Launchpad", "CreateLaunch", input));
+    system.run_next_block();
 
-    system.mint_to(CONTRIBUTOR1, 1000 * ONE_VARA);
-    let _ = program.send_bytes_with_value(CONTRIBUTOR1, b"Launchpad\x00Contribute", 600 * ONE_VARA);
+    let launch_id: u64 = 0;
+    program.send_bytes(CREATOR, encode_call("Launchpad", "StartLaunch", launch_id));
+    system.run_next_block();
 
-    system.spend_blocks(10000);
-    let _ = program.send_bytes(ANYONE, b"Launchpad\x00Finalize");
+    advance_blocks(&system, 15);
+
+    program.send_bytes_with_value(
+        CONTRIBUTOR1,
+        encode_call("Launchpad", "Contribute", launch_id),
+        100 * ONE_VARA,
+    );
+    system.run_next_block();
+
+    advance_blocks(&system, 10000);
+    program.send_bytes(ANYONE, encode_call("Launchpad", "Finalize", launch_id));
+    system.run_next_block();
 
     // Non-creator tries to withdraw
-    let result = program.send_bytes(
+    let msg_id = program.send_bytes(
         ANYONE,
-        b"Launchpad\x00WithdrawFunds",
+        encode_call("Launchpad", "WithdrawFunds", launch_id),
     );
+    let result = system.run_next_block();
 
-    // Should fail - unauthorized
+    assert!(
+        result.failed.contains(&msg_id),
+        "Unauthorized withdraw should fail"
+    );
 }
 
 #[test]
-fn test_query_launch_info() {
+fn test_cancel_launch() {
     let system = setup_system();
     let program = deploy_contract(&system);
 
-    // Create a launch
-    let _ = program.send_bytes(CREATOR, b"Launchpad\x00CreateLaunch");
+    let input = create_test_launch_input(&system);
+    program.send_bytes(CREATOR, encode_call("Launchpad", "CreateLaunch", input));
+    system.run_next_block();
 
-    // Query launch info
-    let result = program.send_bytes(
-        ANYONE,
-        b"Launchpad\x00GetLaunch",
+    let launch_id: u64 = 0;
+
+    // Cancel before starting
+    let msg_id = program.send_bytes(
+        CREATOR,
+        encode_call("Launchpad", "CancelLaunch", launch_id),
     );
+    let result = system.run_next_block();
 
-    assert!(!result.main_failed(), "Query launch should succeed");
+    assert!(
+        result.succeed.contains(&msg_id),
+        "CancelLaunch should succeed for pending launch"
+    );
 }
 
 #[test]
-fn test_get_active_launches() {
+fn test_pause_resume() {
     let system = setup_system();
     let program = deploy_contract(&system);
 
-    // Create and start multiple launches
-    let _ = program.send_bytes(CREATOR, b"Launchpad\x00CreateLaunch");
-    let _ = program.send_bytes(CREATOR, b"Launchpad\x00StartLaunch");
+    // Pause (owner only)
+    let msg_id = program.send_bytes(OWNER, encode_call_no_params("Launchpad", "Pause"));
+    let result = system.run_next_block();
+    assert!(result.succeed.contains(&msg_id), "Pause should succeed");
+
+    // Try to create launch while paused - should fail
+    let input = create_test_launch_input(&system);
+    let msg_id = program.send_bytes(CREATOR, encode_call("Launchpad", "CreateLaunch", input.clone()));
+    let result = system.run_next_block();
+    assert!(result.failed.contains(&msg_id), "CreateLaunch should fail when paused");
+
+    // Resume
+    let msg_id = program.send_bytes(OWNER, encode_call_no_params("Launchpad", "Resume"));
+    let result = system.run_next_block();
+    assert!(result.succeed.contains(&msg_id), "Resume should succeed");
+
+    // Now create launch should work
+    let msg_id = program.send_bytes(CREATOR, encode_call("Launchpad", "CreateLaunch", input));
+    let result = system.run_next_block();
+    assert!(result.succeed.contains(&msg_id), "CreateLaunch should succeed after resume");
+}
+
+#[test]
+fn test_query_launch() {
+    let system = setup_system();
+    let program = deploy_contract(&system);
+
+    let input = create_test_launch_input(&system);
+    program.send_bytes(CREATOR, encode_call("Launchpad", "CreateLaunch", input));
+    system.run_next_block();
+
+    let launch_id: u64 = 0;
+
+    // Query launch
+    let msg_id = program.send_bytes(
+        ANYONE,
+        encode_call("Launchpad", "GetLaunch", launch_id),
+    );
+    let result = system.run_next_block();
+
+    assert!(
+        result.succeed.contains(&msg_id),
+        "GetLaunch query should succeed"
+    );
+}
+
+#[test]
+fn test_query_active_launches() {
+    let system = setup_system();
+    let program = deploy_contract(&system);
+
+    // Create and start a launch
+    let input = create_test_launch_input(&system);
+    program.send_bytes(CREATOR, encode_call("Launchpad", "CreateLaunch", input));
+    system.run_next_block();
+
+    let launch_id: u64 = 0;
+    program.send_bytes(CREATOR, encode_call("Launchpad", "StartLaunch", launch_id));
+    system.run_next_block();
 
     // Query active launches
-    let result = program.send_bytes(
+    let msg_id = program.send_bytes(
         ANYONE,
-        b"Launchpad\x00GetActiveLaunches",
+        encode_call_no_params("Launchpad", "GetActiveLaunches"),
     );
+    let result = system.run_next_block();
 
-    assert!(!result.main_failed(), "Query active launches should succeed");
+    assert!(
+        result.succeed.contains(&msg_id),
+        "GetActiveLaunches query should succeed"
+    );
 }
 
 #[test]
@@ -405,55 +560,98 @@ fn test_full_launch_lifecycle() {
     let program = deploy_contract(&system);
 
     // 1. Create launch
-    let create = program.send_bytes(CREATOR, b"Launchpad\x00CreateLaunch");
-    assert!(!create.main_failed(), "Create should succeed");
+    let mut input = create_test_launch_input(&system);
+    input.min_raise = 100 * ONE_VARA;
 
-    // 2. Setup whitelist (optional)
-    let whitelist = program.send_bytes(CREATOR, b"Launchpad\x00AddToWhitelist");
-    assert!(!whitelist.main_failed(), "Whitelist should succeed");
+    let msg_id = program.send_bytes(CREATOR, encode_call("Launchpad", "CreateLaunch", input));
+    let result = system.run_next_block();
+    assert!(result.succeed.contains(&msg_id), "Create should succeed");
 
-    // 3. Start launch
-    let start = program.send_bytes(CREATOR, b"Launchpad\x00StartLaunch");
-    assert!(!start.main_failed(), "Start should succeed");
+    let launch_id: u64 = 0;
 
-    // 4. Advance to start time
-    system.spend_blocks(1000);
+    // 2. Start launch
+    let msg_id = program.send_bytes(CREATOR, encode_call("Launchpad", "StartLaunch", launch_id));
+    let result = system.run_next_block();
+    assert!(result.succeed.contains(&msg_id), "Start should succeed");
 
-    // 5. Contributors participate
-    system.mint_to(CONTRIBUTOR1, 1000 * ONE_VARA);
-    system.mint_to(CONTRIBUTOR2, 1000 * ONE_VARA);
+    // 3. Advance to start time
+    advance_blocks(&system, 15);
 
-    let contrib1 = program.send_bytes_with_value(
+    // 4. Contributors participate
+    let msg_id = program.send_bytes_with_value(
         CONTRIBUTOR1,
-        b"Launchpad\x00Contribute",
-        300 * ONE_VARA,
+        encode_call("Launchpad", "Contribute", launch_id),
+        60 * ONE_VARA,
     );
-    assert!(!contrib1.main_failed(), "Contribution 1 should succeed");
+    let result = system.run_next_block();
+    assert!(result.succeed.contains(&msg_id), "Contribution 1 should succeed");
 
-    let contrib2 = program.send_bytes_with_value(
+    let msg_id = program.send_bytes_with_value(
         CONTRIBUTOR2,
-        b"Launchpad\x00Contribute",
-        300 * ONE_VARA,
+        encode_call("Launchpad", "Contribute", launch_id),
+        60 * ONE_VARA,
     );
-    assert!(!contrib2.main_failed(), "Contribution 2 should succeed");
+    let result = system.run_next_block();
+    assert!(result.succeed.contains(&msg_id), "Contribution 2 should succeed");
 
-    // 6. Advance past end time
-    system.spend_blocks(10000);
+    // 5. Advance past end time
+    advance_blocks(&system, 10000);
 
-    // 7. Finalize
-    let finalize = program.send_bytes(ANYONE, b"Launchpad\x00Finalize");
-    assert!(!finalize.main_failed(), "Finalize should succeed");
+    // 6. Finalize
+    let msg_id = program.send_bytes(ANYONE, encode_call("Launchpad", "Finalize", launch_id));
+    let result = system.run_next_block();
+    assert!(result.succeed.contains(&msg_id), "Finalize should succeed");
 
-    // 8. Creator withdraws
-    let withdraw = program.send_bytes(CREATOR, b"Launchpad\x00WithdrawFunds");
-    assert!(!withdraw.main_failed(), "Withdraw should succeed");
+    // 7. Creator withdraws funds
+    let msg_id = program.send_bytes(CREATOR, encode_call("Launchpad", "WithdrawFunds", launch_id));
+    let result = system.run_next_block();
+    assert!(result.succeed.contains(&msg_id), "Withdraw should succeed");
 
-    // 9. Contributors claim tokens
-    let claim1 = program.send_bytes(CONTRIBUTOR1, b"Launchpad\x00ClaimTokens");
-    assert!(!claim1.main_failed(), "Claim 1 should succeed");
+    // 8. Contributors claim tokens
+    let msg_id = program.send_bytes(CONTRIBUTOR1, encode_call("Launchpad", "ClaimTokens", launch_id));
+    let result = system.run_next_block();
+    assert!(result.succeed.contains(&msg_id), "Claim 1 should succeed");
 
-    let claim2 = program.send_bytes(CONTRIBUTOR2, b"Launchpad\x00ClaimTokens");
-    assert!(!claim2.main_failed(), "Claim 2 should succeed");
+    let msg_id = program.send_bytes(CONTRIBUTOR2, encode_call("Launchpad", "ClaimTokens", launch_id));
+    let result = system.run_next_block();
+    assert!(result.succeed.contains(&msg_id), "Claim 2 should succeed");
+}
+
+#[test]
+fn test_contribution_limits() {
+    let system = setup_system();
+    let program = deploy_contract(&system);
+
+    // Create launch with low max_per_wallet
+    let mut input = create_test_launch_input(&system);
+    input.max_per_wallet = 50 * ONE_VARA;
+
+    program.send_bytes(CREATOR, encode_call("Launchpad", "CreateLaunch", input));
+    system.run_next_block();
+
+    let launch_id: u64 = 0;
+    program.send_bytes(CREATOR, encode_call("Launchpad", "StartLaunch", launch_id));
+    system.run_next_block();
+
+    advance_blocks(&system, 15);
+
+    // First contribution at limit
+    let msg_id = program.send_bytes_with_value(
+        CONTRIBUTOR1,
+        encode_call("Launchpad", "Contribute", launch_id),
+        50 * ONE_VARA,
+    );
+    let result = system.run_next_block();
+    assert!(result.succeed.contains(&msg_id), "First contribution should succeed");
+
+    // Second contribution should fail (at limit)
+    let msg_id = program.send_bytes_with_value(
+        CONTRIBUTOR1,
+        encode_call("Launchpad", "Contribute", launch_id),
+        10 * ONE_VARA,
+    );
+    let result = system.run_next_block();
+    assert!(result.failed.contains(&msg_id), "Over-limit contribution should fail");
 }
 
 #[test]
@@ -461,42 +659,40 @@ fn test_withdraw_platform_fees() {
     let system = setup_system();
     let program = deploy_contract(&system);
 
-    // Complete a successful launch to accumulate fees
-    let _ = program.send_bytes(CREATOR, b"Launchpad\x00CreateLaunch");
-    let _ = program.send_bytes(CREATOR, b"Launchpad\x00StartLaunch");
+    // Complete a successful launch
+    let mut input = create_test_launch_input(&system);
+    input.min_raise = 50 * ONE_VARA;
 
-    system.spend_blocks(1000);
+    program.send_bytes(CREATOR, encode_call("Launchpad", "CreateLaunch", input));
+    system.run_next_block();
 
-    system.mint_to(CONTRIBUTOR1, 1000 * ONE_VARA);
-    let _ = program.send_bytes_with_value(CONTRIBUTOR1, b"Launchpad\x00Contribute", 600 * ONE_VARA);
+    let launch_id: u64 = 0;
+    program.send_bytes(CREATOR, encode_call("Launchpad", "StartLaunch", launch_id));
+    system.run_next_block();
 
-    system.spend_blocks(10000);
-    let _ = program.send_bytes(ANYONE, b"Launchpad\x00Finalize");
-    let _ = program.send_bytes(CREATOR, b"Launchpad\x00WithdrawFunds");
+    advance_blocks(&system, 15);
 
-    // Owner withdraws accumulated fees
-    let result = program.send_bytes(
-        OWNER,
-        b"Launchpad\x00WithdrawFees",
+    program.send_bytes_with_value(
+        CONTRIBUTOR1,
+        encode_call("Launchpad", "Contribute", launch_id),
+        100 * ONE_VARA,
     );
+    system.run_next_block();
 
-    // Should succeed if fees accumulated
-}
+    advance_blocks(&system, 10000);
+    program.send_bytes(ANYONE, encode_call("Launchpad", "Finalize", launch_id));
+    system.run_next_block();
 
-#[test]
-fn test_is_whitelisted_query() {
-    let system = setup_system();
-    let program = deploy_contract(&system);
+    // Creator withdraws (generates fees)
+    program.send_bytes(CREATOR, encode_call("Launchpad", "WithdrawFunds", launch_id));
+    system.run_next_block();
 
-    // Create launch and add to whitelist
-    let _ = program.send_bytes(CREATOR, b"Launchpad\x00CreateLaunch");
-    let _ = program.send_bytes(CREATOR, b"Launchpad\x00AddToWhitelist");
+    // Owner withdraws fees
+    let msg_id = program.send_bytes(OWNER, encode_call_no_params("Launchpad", "WithdrawFees"));
+    let result = system.run_next_block();
 
-    // Query whitelist status
-    let result = program.send_bytes(
-        ANYONE,
-        b"Launchpad\x00IsWhitelisted",
+    assert!(
+        result.succeed.contains(&msg_id),
+        "WithdrawFees should succeed for owner"
     );
-
-    assert!(!result.main_failed(), "Whitelist query should succeed");
 }

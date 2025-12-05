@@ -1,296 +1,392 @@
 # Integration Patterns
 
-This guide describes optional integration patterns between contracts in this library.
+This guide covers integration patterns for the Vara Launchpad Contract.
 
-## Contract Dependencies
+## Frontend Integration
 
-While each contract is standalone, they can be composed for enhanced functionality:
+### JavaScript/TypeScript with Sails
 
+```typescript
+import { GearApi, decodeAddress } from '@gear-js/api';
+import { Sails } from 'sails-js';
+
+// Connect to Vara Network
+const api = await GearApi.create({ providerAddress: 'wss://testnet.vara.network' });
+
+// Load IDL
+const idl = await fetch('/launchpad.idl').then(r => r.text());
+const sails = new Sails(api);
+sails.parseIdl(idl);
+
+// Connect to deployed contract
+const programId = '0x...';
+sails.setProgramId(programId);
+
+// Query active launches
+const activeLaunches = await sails.services.Launchpad.queries.GetActiveLaunches();
+
+// Create a launch
+const input = {
+  title: 'My Token Sale',
+  description: 'Fair launch',
+  token_address: decodeAddress('kG...'),
+  total_tokens: BigInt(1000000) * BigInt(10**12),
+  price_per_token: BigInt(10**9), // 0.001 VARA
+  min_raise: BigInt(100) * BigInt(10**12),
+  max_raise: BigInt(1000) * BigInt(10**12),
+  max_per_wallet: BigInt(100) * BigInt(10**12),
+  start_time: currentBlock + 1000,
+  end_time: currentBlock + 10000,
+  whitelist_enabled: false,
+  vesting_config: null,
+};
+
+const tx = sails.services.Launchpad.functions.CreateLaunch(input);
+await tx.signAndSend(account);
+
+// Contribute to a launch
+const contributeTx = sails.services.Launchpad.functions.Contribute(launchId);
+await contributeTx.withValue(BigInt(50) * BigInt(10**12)).signAndSend(account);
 ```
-┌─────────────────┐     ┌─────────────────┐
-│  Access Control │◄────│    Any Contract │
-│     (RBAC)      │     │  (role checks)  │
-└─────────────────┘     └─────────────────┘
-         ▲
-         │
-┌────────┴────────┐     ┌─────────────────┐
-│    Reputation   │◄────│    Governance   │
-│    (scoring)    │     │  (vote weight)  │
-└─────────────────┘     └─────────────────┘
+
+### Event Subscription
+
+```typescript
+// Subscribe to all launchpad events
+api.gearEvents.subscribeToGearEvent('UserMessageSent', ({ data }) => {
+  if (data.source.eq(programId)) {
+    const event = sails.services.Launchpad.events.decode(data.payload);
+
+    switch (event.type) {
+      case 'LaunchCreated':
+        console.log('New launch:', event.launch_id);
+        break;
+      case 'Contributed':
+        console.log('Contribution:', event.amount);
+        break;
+      case 'LaunchSucceeded':
+        console.log('Launch succeeded:', event.launch_id);
+        break;
+    }
+  }
+});
 ```
 
-## Integration Examples
+## Backend Integration
 
-### Access Control + Any Contract
-
-Use Access Control for role management in other contracts:
+### Rust Client
 
 ```rust
-// In your contract
-fn check_admin(&self, account: ActorId) -> bool {
-    // Call access control contract
-    let result: bool = msg::send_for_reply(
-        access_control_id,
-        AccessControlAction::HasRole {
-            role: ADMIN_ROLE,
-            account,
-        },
-        0,
-        0,
-    ).await.unwrap();
-    result
-}
+use sails_rs::gclient::GearApi;
+use launchpad_client::LaunchpadClient;
 
-fn restricted_operation(&mut self) -> Result<(), Error> {
-    let caller = msg::source();
-    if !self.check_admin(caller) {
-        return Err(Error::Unauthorized);
-    }
-    // Proceed with operation
+async fn interact_with_launchpad() -> Result<(), Error> {
+    // Connect to network
+    let api = GearApi::init(Some("wss://testnet.vara.network")).await?;
+
+    // Create client
+    let program_id = "0x...".parse()?;
+    let client = LaunchpadClient::new(&api, program_id);
+
+    // Query launches
+    let active = client.get_active_launches().await?;
+
+    // Create launch
+    let input = CreateLaunchInput {
+        title: "My Launch".into(),
+        // ... other fields
+    };
+    let launch_id = client.create_launch(input).await?;
+
+    // Contribute
+    let tokens = client.contribute(launch_id, value).await?;
+
     Ok(())
 }
 ```
 
-### Reputation + Governance
-
-Use reputation scores as vote weights:
+### Event Indexer
 
 ```rust
-// In governance contract
-fn get_vote_weight(&self, voter: ActorId) -> u128 {
-    // Get reputation score from Reputation contract
-    let reputation: i64 = msg::send_for_reply(
-        reputation_contract_id,
-        ReputationAction::GetScore { user: voter },
-        0,
-        0,
-    ).await.unwrap();
+use sails_rs::gclient::GearApi;
+use futures::StreamExt;
 
-    // Convert to vote weight (minimum 1)
-    reputation.max(0) as u128 + 1
+async fn index_events(api: &GearApi, program_id: ProgramId) {
+    let mut subscription = api.subscribe_to_all_messages().await.unwrap();
+
+    while let Some(message) = subscription.next().await {
+        if message.source() == program_id {
+            match decode_event(&message.payload()) {
+                LaunchpadEvent::LaunchCreated { launch_id, creator, .. } => {
+                    // Index in database
+                    db.insert_launch(launch_id, creator).await;
+                }
+                LaunchpadEvent::Contributed { launch_id, contributor, amount, .. } => {
+                    // Update contribution records
+                    db.record_contribution(launch_id, contributor, amount).await;
+                }
+                // Handle other events...
+            }
+        }
+    }
 }
 ```
 
-### Launchpad + Vesting
+## VFT Token Integration
 
-Auto-create vesting schedules for token purchases:
+### Token Deposit Flow
+
+For projects that want to pre-deposit tokens:
 
 ```rust
-// In launchpad after successful claim
-async fn create_vesting_for_purchase(
-    &self,
-    buyer: ActorId,
-    tokens: u128,
-    config: &VestingConfig,
-) -> Result<u64, Error> {
-    let schedule_id: u64 = msg::send_for_reply(
-        vesting_contract_id,
-        VestingAction::CreateSchedule {
-            beneficiary: buyer,
-            amount: tokens,
-            start_block: config.start_block,
-            cliff_duration: config.cliff_duration,
-            vesting_duration: config.vesting_duration,
-            revocable: false,
-        },
-        0,
-        0,
-    ).await?;
+// Creator deposits tokens before launch
+async fn deposit_tokens(
+    vft_client: &VftClient,
+    launchpad_id: ProgramId,
+    amount: u128,
+) -> Result<(), Error> {
+    // Approve launchpad to spend tokens
+    vft_client.approve(launchpad_id, amount).await?;
 
-    Ok(schedule_id)
+    // Transfer tokens to launchpad
+    vft_client.transfer(launchpad_id, amount).await?;
+
+    // Mark as deposited (optional, for UI)
+    launchpad_client.mark_tokens_deposited(launch_id).await?;
+
+    Ok(())
 }
 ```
 
-### Crowdfunding + Reputation
+### Token Distribution
 
-Award badges to contributors:
+The contract tracks token allocations. For actual VFT transfers, integrate with your token contract:
 
-```rust
-// After contribution
-async fn award_backer_badge(&self, contributor: ActorId, amount: u128) {
-    let badge_id = if amount >= 1000 * DECIMALS {
-        WHALE_BACKER_BADGE
-    } else if amount >= 100 * DECIMALS {
-        GOLD_BACKER_BADGE
-    } else {
-        BRONZE_BACKER_BADGE
-    };
-
-    let _ = msg::send(
-        reputation_contract_id,
-        ReputationAction::AwardBadge {
-            user: contributor,
-            badge_id,
-        },
-        0,
-    );
+```typescript
+// After successful claim
+async function distributeTokens(
+  vftContract: VftClient,
+  claimer: Address,
+  amount: bigint,
+): Promise<void> {
+  // Transfer tokens from treasury/launchpad to claimer
+  await vftContract.transfer(claimer, amount);
 }
 ```
 
-### Escrow + Reputation
+## Multi-Launch Platform
 
-Update reputation based on deal outcomes:
+### Centralized Launch Management
 
-```rust
-// After successful deal completion
-async fn update_deal_reputation(&self, deal: &Deal) {
-    // Increase seller reputation
-    msg::send(
-        reputation_contract_id,
-        ReputationAction::AddReputation {
-            user: deal.seller,
-            amount: 10,
-            reason: "Completed escrow deal".into(),
-        },
-        0,
-    );
+```typescript
+class LaunchpadManager {
+  constructor(
+    private sails: Sails,
+    private db: Database,
+  ) {}
 
-    // Increase buyer reputation
-    msg::send(
-        reputation_contract_id,
-        ReputationAction::AddReputation {
-            user: deal.buyer,
-            amount: 5,
-            reason: "Released escrow payment".into(),
-        },
-        0,
-    );
+  async createLaunch(params: LaunchParams): Promise<LaunchId> {
+    // Validate params
+    this.validateParams(params);
+
+    // Create on-chain
+    const launchId = await this.sails.services.Launchpad
+      .functions.CreateLaunch(params.toInput())
+      .signAndSend(params.creator);
+
+    // Store metadata off-chain
+    await this.db.storeLaunchMetadata(launchId, {
+      images: params.images,
+      socials: params.socials,
+      whitepaper: params.whitepaper,
+    });
+
+    return launchId;
+  }
+
+  async getLaunchWithMetadata(launchId: LaunchId): Promise<LaunchDetails> {
+    // Fetch on-chain data
+    const launch = await this.sails.services.Launchpad
+      .queries.GetLaunch(launchId);
+
+    // Fetch off-chain metadata
+    const metadata = await this.db.getLaunchMetadata(launchId);
+
+    return { ...launch, ...metadata };
+  }
 }
 ```
 
-## Cross-Contract Communication
+### Batch Operations
 
-### Synchronous Queries
-
-For read-only operations, use synchronous message passing:
-
-```rust
-async fn query_contract<T: Decode>(
-    target: ActorId,
-    payload: impl Encode,
-) -> Result<T, Error> {
-    msg::send_for_reply_as(target, payload, 0, 0)
-        .await
-        .map_err(|_| Error::CrossContractCallFailed)
+```typescript
+// Batch whitelist updates
+async function batchWhitelist(
+  sails: Sails,
+  launchId: LaunchId,
+  addresses: string[],
+  batchSize: number = 100,
+): Promise<void> {
+  for (let i = 0; i < addresses.length; i += batchSize) {
+    const batch = addresses.slice(i, i + batchSize);
+    await sails.services.Launchpad
+      .functions.AddToWhitelist(launchId, batch)
+      .signAndSend(creator);
+  }
 }
 ```
 
-### Asynchronous Actions
+## Analytics Integration
 
-For state-changing operations with callbacks:
+### Event Processing Pipeline
 
-```rust
-async fn call_with_callback<T: Decode>(
-    target: ActorId,
-    payload: impl Encode,
-    value: u128,
-) -> Result<T, Error> {
-    let result = msg::send_for_reply_as(target, payload, value, 0)
-        .await
-        .map_err(|_| Error::CrossContractCallFailed)?;
+```typescript
+class LaunchpadEventProcessor {
+  async processEvent(event: LaunchpadEvent): Promise<void> {
+    switch (event.type) {
+      case 'LaunchCreated':
+        await this.analytics.trackLaunchCreated({
+          launchId: event.launch_id,
+          creator: event.creator,
+          totalTokens: event.total_tokens,
+          pricePerToken: event.price_per_token,
+        });
+        break;
 
-    // Handle callback
-    Ok(result)
+      case 'Contributed':
+        await this.analytics.trackContribution({
+          launchId: event.launch_id,
+          contributor: event.contributor,
+          amount: event.amount,
+          tokensReceived: event.tokens_purchased,
+        });
+        break;
+
+      case 'LaunchSucceeded':
+        await this.analytics.trackLaunchSuccess({
+          launchId: event.launch_id,
+          totalRaised: event.total_raised,
+        });
+        break;
+    }
+  }
+}
+```
+
+### Dashboard Metrics
+
+```typescript
+interface LaunchpadMetrics {
+  totalLaunches: number;
+  activeLaunches: number;
+  successfulLaunches: number;
+  totalRaised: bigint;
+  totalContributors: number;
+  platformFees: bigint;
+}
+
+async function getMetrics(sails: Sails): Promise<LaunchpadMetrics> {
+  const [launchCount, fees] = await Promise.all([
+    sails.services.Launchpad.queries.GetLaunchCount(),
+    sails.services.Launchpad.queries.GetAccumulatedFees(),
+  ]);
+
+  return {
+    totalLaunches: launchCount,
+    // ... aggregate from indexed events
+    platformFees: fees,
+  };
+}
+```
+
+## Error Handling
+
+### Contract Errors
+
+```typescript
+function handleContractError(error: any): UserFriendlyError {
+  const errorType = parseContractError(error);
+
+  switch (errorType) {
+    case 'Unauthorized':
+      return { message: 'You are not authorized to perform this action' };
+    case 'NotFound':
+      return { message: 'Launch not found' };
+    case 'InvalidState':
+      return { message: 'This action is not available in the current state' };
+    default:
+      return { message: 'An unexpected error occurred' };
+  }
+}
+```
+
+### Retry Logic
+
+```typescript
+async function contributeWithRetry(
+  sails: Sails,
+  launchId: LaunchId,
+  amount: bigint,
+  maxRetries: number = 3,
+): Promise<ContributionResult> {
+  for (let attempt = 0; attempt < maxRetries; attempt++) {
+    try {
+      return await sails.services.Launchpad
+        .functions.Contribute(launchId)
+        .withValue(amount)
+        .signAndSend(account);
+    } catch (error) {
+      if (isTransientError(error) && attempt < maxRetries - 1) {
+        await delay(1000 * (attempt + 1));
+        continue;
+      }
+      throw error;
+    }
+  }
 }
 ```
 
 ## Best Practices
 
-### 1. Loose Coupling
+### Gas Management
 
-Keep integrations optional:
+```typescript
+async function estimateAndExecute(
+  sails: Sails,
+  tx: Transaction,
+): Promise<Result> {
+  const gasInfo = await tx.calculateGas();
+  const gasLimit = gasInfo.min_limit * 12n / 10n; // 20% buffer
 
-```rust
-pub struct MyContract {
-    // Optional integration
-    reputation_contract: Option<ActorId>,
-}
-
-fn award_reputation(&self, user: ActorId, amount: i64) {
-    if let Some(rep_contract) = self.reputation_contract {
-        let _ = msg::send(rep_contract, /* ... */, 0);
-    }
+  return tx.withGas(gasLimit).signAndSend(account);
 }
 ```
 
-### 2. Error Handling
+### State Consistency
 
-Don't fail primary operations on integration failures:
+```typescript
+async function safeContribute(
+  sails: Sails,
+  launchId: LaunchId,
+  amount: bigint,
+): Promise<void> {
+  // Fetch current state
+  const launch = await sails.services.Launchpad.queries.GetLaunch(launchId);
 
-```rust
-// Award badge but don't fail if it errors
-let _ = self.award_reputation_badge(user, badge_id).await;
+  // Validate
+  if (launch.status !== 'Active') {
+    throw new Error('Launch is not active');
+  }
 
-// Continue with primary operation
-self.complete_action()?;
-```
+  const currentBlock = await getCurrentBlock();
+  if (currentBlock < launch.start_time || currentBlock > launch.end_time) {
+    throw new Error('Outside contribution window');
+  }
 
-### 3. Gas Management
-
-Account for cross-contract call gas:
-
-```rust
-const CROSS_CONTRACT_GAS: u64 = 10_000_000_000;
-
-fn calculate_total_gas(base_gas: u64, cross_calls: u64) -> u64 {
-    base_gas + (cross_calls * CROSS_CONTRACT_GAS)
-}
-```
-
-### 4. Event Consistency
-
-Emit events for cross-contract operations:
-
-```rust
-fn emit_integration_event(&self, action: &str, target: ActorId) {
-    let _ = self.emit_event(MyEvent::CrossContractCall {
-        action: action.into(),
-        target,
-        timestamp: exec::block_timestamp(),
-    });
-}
-```
-
-## Deployment Considerations
-
-### Contract Dependencies
-
-Deploy in order of dependency:
-1. Access Control (foundation)
-2. Reputation (used by others)
-3. Vesting (used by launchpad)
-4. Other contracts
-
-### Configuration
-
-Store integrated contract addresses:
-
-```rust
-pub struct Config {
-    access_control: Option<ActorId>,
-    reputation: Option<ActorId>,
-    vesting: Option<ActorId>,
-}
-
-fn init_integrations(&mut self, config: Config) {
-    self.config = config;
-}
-```
-
-### Testing Integrations
-
-Test with deployed contracts:
-
-```rust
-#[tokio::test]
-async fn test_integration() {
-    let system = System::new();
-
-    // Deploy both contracts
-    let access_control = deploy_access_control(&system);
-    let my_contract = deploy_my_contract(&system, access_control);
-
-    // Test integrated behavior
-    my_contract.call_with_access_control();
+  // Execute
+  await sails.services.Launchpad
+    .functions.Contribute(launchId)
+    .withValue(amount)
+    .signAndSend(account);
 }
 ```

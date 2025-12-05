@@ -12,7 +12,6 @@ sails-rs.workspace = true
 launchpad-app = { path = "app" }
 sails-rs = { workspace = true, features = ["wasm-builder"] }
 sails-idl-gen.workspace = true
-serde_json.workspace = true
 
 [dev-dependencies]
 launchpad = { path = ".", features = ["wasm-binary"] }

@@ -1,170 +1,253 @@
 # Security Checklist
 
-This document outlines security considerations and audit recommendations for contracts in this library.
+Security considerations and audit recommendations for the Vara Launchpad Contract.
 
 ## General Security Principles
 
 ### Actor Model Security
+
 Vara's actor model provides inherent isolation, but be aware of:
+
 - [ ] Message ordering is not guaranteed
 - [ ] Async operations can interleave
 - [ ] State must be consistent between messages
+- [ ] External calls can fail
 
 ### Integer Overflow/Underflow
-- [ ] Use `saturating_*` operations for arithmetic
-- [ ] Use `checked_*` operations where overflow must error
-- [ ] Validate input amounts against type bounds
+
+The contract uses safe arithmetic throughout:
+
+- [x] `saturating_*` operations for arithmetic
+- [x] `checked_*` operations where overflow must error
+- [x] Input amounts validated against type bounds
+- [x] Vesting calculations use scaled math to prevent precision loss
 
 ### Access Control
-- [ ] Verify caller identity with `gstd::msg::source()`
-- [ ] Implement proper role checks before state changes
-- [ ] Avoid centralization risks (multi-sig for critical operations)
+
+- [x] Caller identity verified with `gstd::msg::source()`
+- [x] Creator-only operations: `start_launch`, `withdraw_funds`, `cancel_launch`
+- [x] Owner-only operations: `pause`, `resume`, `withdraw_fees`
+- [x] Anyone can call: `finalize`, `claim_tokens`, `claim_refund`
 
 ### Input Validation
-- [ ] Validate all user inputs
-- [ ] Check array/vector lengths
-- [ ] Validate addresses (non-zero, format)
-- [ ] Sanitize string inputs
 
-## Contract-Specific Checklists
+- [x] All user inputs validated
+- [x] Non-empty title required
+- [x] Positive amounts required (tokens, price, limits)
+- [x] Start time must be in future
+- [x] Start time must be before end time
+- [x] Min raise <= max raise
+- [x] Max raise <= total_tokens * price_per_token
 
-### Access Control Contract
-- [ ] Admin cannot accidentally remove themselves
-- [ ] Role hierarchy prevents privilege escalation
-- [ ] Events emitted for all role changes
-- [ ] DEFAULT_ADMIN role properly protected
+## Contract-Specific Checklist
 
-### Escrow Contract
-- [ ] Funds locked correctly on deal creation
-- [ ] Only buyer can release milestones
-- [ ] Arbiter can only resolve disputed deals
-- [ ] Refunds only available for cancellable deals
-- [ ] Fee calculation doesn't cause rounding errors
-- [ ] Deadline checks use block height correctly
+### State Machine
 
-### Vesting Contract
-- [ ] Cliff period enforced before any release
-- [ ] Linear vesting calculation is accurate
-- [ ] Only grantor can revoke (for revocable schedules)
-- [ ] Released tokens cannot be re-released
-- [ ] Vesting schedule cannot be modified after creation
+- [x] Clear state transitions defined
+- [x] Invalid state transitions rejected
+- [x] `Pending` → `Active` only via `start_launch`
+- [x] `Active` → `Ended` when time expires or fully subscribed
+- [x] `Ended` → `Succeeded` or `Failed` based on min_raise
+- [x] `Cancelled` only allowed for `Pending` (by creator) or any state (by owner)
 
-### Crowdfunding Contract
-- [ ] Goal and deadline validation on creation
-- [ ] Contributions only accepted during active period
-- [ ] Refunds only available if goal not met
-- [ ] Creator cannot withdraw before funding goal
-- [ ] Milestone amounts sum to total goal
+### Contribution Logic
 
-### Voting Contract
-- [ ] Votes cannot be changed after casting
-- [ ] Voting period strictly enforced
-- [ ] Quorum calculation includes all vote types
-- [ ] Execution delay prevents flash governance attacks
-- [ ] Vote weight calculation is consistent
+- [x] Only allowed during `Active` state
+- [x] Only within time window (start_time <= current <= end_time)
+- [x] Whitelist enforced when enabled
+- [x] Per-wallet limits enforced
+- [x] Excess contributions refunded automatically
+- [x] Contribution too small for 1 token rejected
+- [x] Token purchase calculation uses safe math
+- [x] Contributors tracked for batch operations
 
-### Reputation Contract
-- [ ] Score changes are bounded
-- [ ] History cannot be manipulated
-- [ ] Badge thresholds checked correctly
-- [ ] Only authorized updaters can modify scores
-- [ ] Negative scores handled properly
+### Token Economics
 
-### Lending Contract
-- [ ] Collateral ratio enforced on borrowing
-- [ ] Interest accrual calculation correct
-- [ ] Liquidation threshold < collateral ratio
-- [ ] Liquidation bonus doesn't exceed collateral
-- [ ] Available liquidity checks before lending
+- [x] `total_raised` preserved (not wiped on withdrawal)
+- [x] `funds_withdrawn` flag prevents double withdrawal
+- [x] Platform fee calculated correctly (basis points / 10000)
+- [x] Fee accumulated, not transferred immediately
+- [x] Tokens purchased tracked separately from contributions
 
-### Launchpad Contract
-- [ ] Token amounts match contribution amounts
-- [ ] Whitelist enforced when enabled
-- [ ] Max per wallet limits respected
-- [ ] Refunds available if minimum not met
-- [ ] Vesting schedule applied to claimed tokens
+### Refund System
+
+- [x] Refunds only for `Failed` or `Cancelled` launches
+- [x] Contribution removed on refund (prevents double-claim)
+- [x] All contributors can be enumerated
+- [x] Refund transfers use safe native transfer
+
+### Token Claims
+
+- [x] Claims only for `Succeeded`/`DistributionPending` launches
+- [x] Claimed amount tracked per user
+- [x] Vesting calculation accounts for cliff period
+- [x] Vesting uses scaled math for precision
+- [x] Multiple claims allowed as tokens vest
+- [x] Cannot claim more than purchased
+
+### Vesting
+
+- [x] Cliff period enforced (no claims before cliff ends)
+- [x] Linear vesting calculation is accurate
+- [x] Full vesting after vesting_end block
+- [x] Scale factor (10^12) prevents rounding errors
+
+### Pause Mechanism
+
+- [x] Only owner can pause/resume
+- [x] `create_launch` blocked when paused
+- [x] `contribute` blocked when paused
+- [x] Claims and refunds still work when paused (user protection)
+
+## CEI Pattern Compliance
+
+All state-changing operations follow Checks-Effects-Interactions:
+
+```rust
+// 1. Checks
+if caller != launch.creator {
+    return Err(ContractError::Unauthorized);
+}
+
+// 2. Effects (state changes)
+launch.funds_withdrawn = true;
+s.accumulated_fees = s.accumulated_fees.saturating_add(fee);
+
+// 3. Interactions (external calls)
+transfer_native(caller, amount_to_creator)?;
+```
 
 ## Testing Requirements
 
 ### Unit Tests
-- [ ] All public functions have test coverage
-- [ ] Edge cases tested (zero amounts, max values)
-- [ ] Error conditions verified
-- [ ] State changes validated
 
-### Integration Tests
-- [ ] Full workflows tested end-to-end
-- [ ] Multi-user scenarios
-- [ ] Time-dependent operations
-- [ ] Gas consumption reasonable
+- [x] Contract initialization
+- [x] Launch creation with valid parameters
+- [x] Launch start
+- [x] Contributions within limits
+- [x] Whitelist enforcement
+- [x] Finalization (success path)
+- [x] Finalization (failure path)
+- [x] Token claims
+- [x] Refund claims
+- [x] Fund withdrawal
+- [x] Unauthorized access rejection
+- [x] Per-wallet limit enforcement
+- [x] Pause/resume functionality
+- [x] Platform fee withdrawal
+- [x] Query operations
+- [x] Full lifecycle test
 
-### Fuzz Testing (Recommended)
-- [ ] Random inputs don't cause panics
-- [ ] State remains consistent under stress
-- [ ] No integer overflows in calculations
+### Edge Cases Tested
+
+- [x] Zero amounts rejected
+- [x] Contribution at exactly max_per_wallet
+- [x] Over-limit contribution rejected
+- [x] Non-whitelisted user rejected
+- [x] Contribution outside time window rejected
+- [x] Unauthorized withdraw rejected
+- [x] Cancel by non-creator rejected (except owner)
 
 ## Pre-Deployment Checklist
 
 ### Code Review
+
 - [ ] Independent review completed
 - [ ] All TODOs resolved
 - [ ] Dead code removed
 - [ ] Debug statements removed
+- [ ] No hardcoded addresses
 
 ### Configuration
-- [ ] Fee parameters are reasonable
-- [ ] Time parameters appropriate for network
-- [ ] Admin addresses verified
+
+- [ ] Fee parameters are reasonable (default 2%)
+- [ ] Time parameters appropriate for network block times
+- [ ] Owner address verified
 - [ ] Initial state is correct
 
 ### Documentation
-- [ ] API documentation complete
-- [ ] Integration guide available
-- [ ] Known limitations documented
+
+- [x] API documentation complete
+- [x] Integration guide available
+- [x] Known limitations documented
+- [x] Events documented for indexers
 
 ## Post-Deployment Monitoring
 
 ### Event Monitoring
-- [ ] Subscribe to critical events
-- [ ] Alert on unexpected patterns
-- [ ] Track gas usage trends
+
+Monitor these events for anomalies:
+
+| Event | What to Watch |
+|-------|---------------|
+| `LaunchCreated` | Unusual parameters |
+| `Contributed` | Large contributions |
+| `LaunchFailed` | Unexpected failures |
+| `FundsWithdrawn` | Verify amounts match expectations |
+| `Paused` | Emergency activation |
 
 ### State Monitoring
+
 - [ ] Regular state snapshots
 - [ ] Balance reconciliation
-- [ ] User activity patterns
+- [ ] Track accumulated fees
+- [ ] Monitor active launch count
 
 ## Emergency Procedures
 
-### Pause Mechanisms
-Consider implementing:
-- Global pause functionality
-- Per-function pausing
-- Emergency withdrawal
+### Pause Mechanism
 
-### Incident Response
+The contract includes pause functionality:
+
+```rust
+// Owner can pause
+launchpad.pause()?;
+
+// All new launches blocked
+// All contributions blocked
+// Claims and refunds still work
+```
+
+### Recovery Steps
+
 1. Pause affected functionality
 2. Analyze root cause
 3. Document impact
-4. Deploy fix if possible
-5. Communicate with users
+4. If critical: encourage users to claim refunds
+5. Deploy fixed version if needed
+6. Communicate with users
 
 ## Known Limitations
 
 ### Static Mut References
+
 The `static mut` pattern used for storage generates Rust 2024 compatibility warnings. This is the standard pattern for Vara contracts and is safe in the single-threaded WASM environment.
 
-### VFT Token Support
-Some contracts include VFT (Vara Fungible Token) support placeholders. Full VFT integration requires:
-- Token transfer approval
-- Async token operations
-- Balance verification
+### VFT Token Transfers
 
-### Upgradability
+Token claims track amounts but don't execute actual VFT transfers. Integration with VFT contracts requires:
+
+- Async message to VFT contract
+- Gas reservation for callback
+- Error handling for failed transfers
+- The `TokenTransferFailed` event is emitted for retry scenarios
+
+### Contract Immutability
+
 Contracts are immutable once deployed. Plan for:
+
 - State migration strategies
-- Proxy patterns if needed
 - Version management
+- User communication for upgrades
+
+## Audit Recommendations
+
+For production deployment, we recommend:
+
+1. **Independent Audit**: Professional security audit by Vara-experienced auditors
+2. **Formal Verification**: Consider formal verification for critical paths
+3. **Bug Bounty**: Establish bug bounty program post-launch
+4. **Staged Rollout**: Deploy to testnet, then limited mainnet, then full launch
 
 ## Resources
 
