@@ -2,7 +2,7 @@
 
 ## ✅ Completed Improvements
 
-### 1. **Token Factory Integration (Pump.fun Style)**
+### 1. **Token Factory Integration**
 - Automatic VFT token deployment using Gear's standard implementation
 - No need for external token contracts - launchpad creates them
 - Compatible with Code ID: `0x81663df58f48684923777cd8cf281bfd2e4ee427926abc52a1fcf4ecd41be7ad`

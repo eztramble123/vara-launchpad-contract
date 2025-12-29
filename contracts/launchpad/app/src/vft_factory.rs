@@ -1,7 +1,7 @@
 //! VFT Token Factory - Deploys new VFT tokens for launches.
 //!
 //! This module handles the deployment of new VFT token contracts
-//! for Pump.fun-style fair launches.
+//! for fair token launches.
 
 use alloc::string::String;
 use alloc::vec::Vec;

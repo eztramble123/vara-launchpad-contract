@@ -6,7 +6,7 @@ A production-ready token launchpad smart contract for the [Vara Network](https:/
 
 This contract enables project creators to conduct fair token sales on Vara Network with:
 
-- **Token Factory**: Automatic VFT token deployment (Pump.fun style)
+- **Token Factory**: Automatic VFT token deployment
 - **Clean State Machine**: Well-defined lifecycle states with proper transitions
 - **Whitelist Support**: Optional address-based access control
 - **Contribution Limits**: Per-wallet caps with automatic excess refunds

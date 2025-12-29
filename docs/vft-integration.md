@@ -2,7 +2,7 @@
 
 ## Overview
 
-The Vara Launchpad uses Gear Foundation's standard VFT (Vara Fungible Token) implementation for token deployment. This ensures compatibility with the Vara ecosystem including DEXes, bridges, and wallets.
+The Vara Launchpad uses Gear Foundation's standard VFT (Vara Fungible Token) implementation for automatic token deployment. This ensures compatibility with the Vara ecosystem including DEXes, bridges, and wallets.
 
 ## Standard VFT Code ID
 
@@ -67,7 +67,7 @@ const launch = await launchpad.createLaunch({
    - Total supply minted to launchpad
    - Launchpad as initial admin/minter/burner
 3. **Token Ready**: Token is immediately available for the launch
-4. **Distribution**: On success, tokens are transferred to buyers
+4. **Fair Distribution**: On success, tokens are transferred to buyers at fixed price
 
 ## VFT Token Features
 
