@@ -1,8 +1,10 @@
 [package]
-name = "launchpad"
+name = "vara-launchpad"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+description = "Vara Token Launchpad with VFT Integration"
+authors = ["Your Name"]
 
 [dependencies]
 launchpad-app = { path = "app" }
@@ -14,7 +16,7 @@ sails-rs = { workspace = true, features = ["wasm-builder"] }
 sails-idl-gen.workspace = true
 
 [dev-dependencies]
-launchpad = { path = ".", features = ["wasm-binary"] }
+vara-launchpad = { path = ".", features = ["wasm-binary"] }
 launchpad-client = { path = "client" }
 sails-rs = { workspace = true, features = ["gtest"] }
 tokio.workspace = true

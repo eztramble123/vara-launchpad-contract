@@ -19,6 +19,11 @@ use scale_info::TypeInfo;
 use sails_rs::prelude::*;
 use vara_contracts_shared::{Amount, BlockNumber, ContractError, Id, VestingConfig};
 
+mod vft_client;
+mod vft_factory;
+use vft_client::{VftClient, TokenMetadata, TokenHolder, LaunchTokenInfo, U256};
+use vft_factory::{VftFactory, TokenConfig};
+
 // =============================================================================
 // STATE MACHINE
 // =============================================================================
@@ -161,9 +166,13 @@ impl Launch {
 #[codec(crate = sails_rs::scale_codec)]
 #[scale_info(crate = sails_rs::scale_info)]
 pub struct CreateLaunchInput {
+    // Token creation parameters
+    pub token_name: String,
+    pub token_symbol: String,
+    
+    // Launch parameters
     pub title: String,
     pub description: String,
-    pub token_address: ActorId,
     pub total_tokens: Amount,
     pub price_per_token: Amount,
     pub min_raise: Amount,
@@ -193,6 +202,10 @@ pub struct LaunchpadStorage {
     fees_withdrawn: Amount,
     /// Paused state.
     paused: bool,
+    /// Code ID of the VFT token contract for deployment.
+    vft_code_id: CodeId,
+    /// Reentrancy guard to prevent recursive calls.
+    reentrancy_guard: bool,
 }
 
 fn storage_mut() -> &'static mut LaunchpadStorage {
@@ -213,6 +226,35 @@ fn init_storage(owner: ActorId, fee_basis_points: u16) {
     let s = storage_mut();
     s.owner = owner;
     s.fee_basis_points = fee_basis_points;
+    // Default to Gear's standard VFT code ID
+    // This can be updated via set_vft_code_id() after deployment
+    s.vft_code_id = CodeId::default();
+}
+
+// =============================================================================
+// SECURITY HELPERS
+// =============================================================================
+
+/// Reentrancy guard to prevent recursive calls.
+struct ReentrancyGuard;
+
+impl ReentrancyGuard {
+    /// Start a guarded operation.
+    fn start() -> Result<Self, ContractError> {
+        let s = storage_mut();
+        if s.reentrancy_guard {
+            return Err(ContractError::invalid_state("Reentrant call"));
+        }
+        s.reentrancy_guard = true;
+        Ok(ReentrancyGuard)
+    }
+}
+
+impl Drop for ReentrancyGuard {
+    fn drop(&mut self) {
+        let s = storage_mut();
+        s.reentrancy_guard = false;
+    }
 }
 
 // =============================================================================
@@ -421,6 +463,14 @@ impl sails_rs::SailsEvent for LaunchpadEvent {
 }
 
 // =============================================================================
+// CONTRACT METADATA
+// =============================================================================
+
+/// Contract name and version.
+pub const CONTRACT_NAME: &str = "Vara Token Launchpad";
+pub const CONTRACT_VERSION: &str = "1.0.0";
+
+// =============================================================================
 // SERVICE IMPLEMENTATION
 // =============================================================================
 
@@ -469,13 +519,29 @@ impl LaunchpadService {
         Ok(())
     }
 
+    /// Set the VFT code ID for token deployment (owner only).
+    #[export(unwrap_result)]
+    pub fn set_vft_code_id(&mut self, code_id: CodeId) -> Result<(), ContractError> {
+        let caller = gstd::msg::source();
+        let s = storage_mut();
+
+        if caller != s.owner {
+            return Err(ContractError::Unauthorized);
+        }
+
+        s.vft_code_id = code_id;
+        Ok(())
+    }
+
     // -------------------------------------------------------------------------
     // LAUNCH CREATION
     // -------------------------------------------------------------------------
 
-    /// Create a new token launch.
+    /// Create a new token launch with automatic token deployment.
     #[export(unwrap_result)]
-    pub fn create_launch(&mut self, input: CreateLaunchInput) -> Result<Id, ContractError> {
+    pub async fn create_launch(&mut self, input: CreateLaunchInput) -> Result<Id, ContractError> {
+        let _guard = ReentrancyGuard::start()?;
+        
         let s = storage_mut();
 
         if s.paused {
@@ -485,7 +551,13 @@ impl LaunchpadService {
         let creator = gstd::msg::source();
         let current_block = gstd::exec::block_height();
 
-        // Validate economic parameters
+        // Validate input parameters
+        if input.token_name.is_empty() {
+            return Err(ContractError::invalid_input("Token name cannot be empty"));
+        }
+        if input.token_symbol.is_empty() {
+            return Err(ContractError::invalid_input("Token symbol cannot be empty"));
+        }
         if input.title.is_empty() {
             return Err(ContractError::invalid_input("Title cannot be empty"));
         }
@@ -514,6 +586,19 @@ impl LaunchpadService {
             return Err(ContractError::invalid_input("Max raise exceeds token value"));
         }
 
+        // Check if VFT code ID is set
+        if s.vft_code_id == CodeId::default() {
+            return Err(ContractError::invalid_state("VFT code ID not set"));
+        }
+
+        // Deploy the token contract
+        let token_address = VftFactory::deploy_token(
+            input.token_name.clone(),
+            input.token_symbol.clone(),
+            U256::from(input.total_tokens),
+            s.vft_code_id,
+        ).await?;
+
         let launch_id = s.next_launch_id;
         s.next_launch_id = s.next_launch_id
             .checked_add(1)
@@ -524,7 +609,7 @@ impl LaunchpadService {
             creator,
             title: input.title.clone(),
             description: input.description,
-            token_address: input.token_address,
+            token_address,  // Use the deployed token address
             total_tokens: input.total_tokens,
             tokens_remaining: input.total_tokens,
             price_per_token: input.price_per_token,
@@ -542,7 +627,7 @@ impl LaunchpadService {
             vesting_config: input.vesting_config,
             status: LaunchStatus::Pending,
             created_at: current_block,
-            tokens_deposited: false,
+            tokens_deposited: true,  // Tokens are minted directly to contract
             funds_withdrawn: false,
             refunds_processed: false,
             contributors: Vec::new(),
@@ -550,11 +635,11 @@ impl LaunchpadService {
 
         s.launches.insert(launch_id, launch);
 
-        self.emit_event(LaunchpadEvent::LaunchCreated {
+        let _ = self.emit_event(LaunchpadEvent::LaunchCreated {
             launch_id,
             creator,
             title: input.title,
-            token_address: input.token_address,
+            token_address,
             total_tokens: input.total_tokens,
             price_per_token: input.price_per_token,
             min_raise: input.min_raise,
@@ -618,35 +703,14 @@ impl LaunchpadService {
             return Err(ContractError::invalid_state("Launch must be in Pending state"));
         }
 
+        // Tokens are already minted to contract during creation
         launch.status = LaunchStatus::Active;
 
-        self.emit_event(LaunchpadEvent::LaunchStarted { launch_id });
+        let _ = self.emit_event(LaunchpadEvent::LaunchStarted { launch_id });
 
         Ok(())
     }
 
-    /// Mark tokens as deposited (for UI warning purposes).
-    #[export(unwrap_result)]
-    pub fn mark_tokens_deposited(&mut self, launch_id: Id) -> Result<(), ContractError> {
-        let s = storage_mut();
-        let caller = gstd::msg::source();
-
-        let launch = s.launches.get_mut(&launch_id)
-            .ok_or(ContractError::NotFound)?;
-
-        if caller != launch.creator {
-            return Err(ContractError::Unauthorized);
-        }
-
-        launch.tokens_deposited = true;
-
-        self.emit_event(LaunchpadEvent::TokensDeposited {
-            launch_id,
-            amount: launch.total_tokens,
-        });
-
-        Ok(())
-    }
 
     // -------------------------------------------------------------------------
     // CONTRIBUTIONS
@@ -888,7 +952,9 @@ impl LaunchpadService {
 
     /// Claim purchased tokens (for successful launches).
     #[export(unwrap_result)]
-    pub fn claim_tokens(&mut self, launch_id: Id) -> Result<Amount, ContractError> {
+    pub async fn claim_tokens(&mut self, launch_id: Id) -> Result<Amount, ContractError> {
+        let _guard = ReentrancyGuard::start()?;
+        
         let s = storage_mut();
         let caller = gstd::msg::source();
         let current_block = gstd::exec::block_height();
@@ -924,19 +990,36 @@ impl LaunchpadService {
         // Update state BEFORE async transfer (CEI pattern)
         *launch.claimed.entry(caller).or_insert(0) += claimable;
 
-        // Emit event
-        self.emit_event(LaunchpadEvent::TokensClaimed {
-            launch_id,
-            user: caller,
-            amount: claimable,
-        });
+        // Perform actual VFT transfer
+        let transfer_result = VftClient::transfer(
+            launch.token_address,
+            caller,
+            U256::from(claimable),
+        ).await;
 
-        // Note: Actual VFT transfer would be async
-        // For now, we just track the claim
-        // In production, you'd send an async message to the VFT contract
-        // and handle success/failure callbacks
-
-        Ok(claimable)
+        match transfer_result {
+            Ok(()) => {
+                self.emit_event(LaunchpadEvent::TokensClaimed {
+                    launch_id,
+                    user: caller,
+                    amount: claimable,
+                });
+                Ok(claimable)
+            }
+            Err(_) => {
+                // Rollback state on transfer failure
+                *launch.claimed.entry(caller).or_insert(0) -= claimable;
+                
+                self.emit_event(LaunchpadEvent::TokenTransferFailed {
+                    launch_id,
+                    user: caller,
+                    amount: claimable,
+                    reason: String::from("VFT transfer failed"),
+                });
+                
+                Err(ContractError::TransferFailed)
+            }
+        }
     }
 
     /// Claim refund (for failed/cancelled launches).
@@ -978,6 +1061,54 @@ impl LaunchpadService {
         }
 
         Ok(contribution)
+    }
+
+    /// Return all deposited tokens to creator when launch fails.
+    #[export(unwrap_result)]
+    pub async fn return_tokens_on_failure(&mut self, launch_id: Id) -> Result<Amount, ContractError> {
+        let s = storage_mut();
+        let caller = gstd::msg::source();
+
+        let launch = s.launches.get_mut(&launch_id)
+            .ok_or(ContractError::NotFound)?;
+
+        // Only creator or owner can return tokens
+        if caller != launch.creator && caller != s.owner {
+            return Err(ContractError::Unauthorized);
+        }
+
+        // Check if launch failed or was cancelled
+        if !matches!(launch.status, LaunchStatus::Failed | LaunchStatus::Cancelled | LaunchStatus::RefundAvailable) {
+            return Err(ContractError::invalid_state("Launch must be failed or cancelled"));
+        }
+
+        // Check if tokens were deposited
+        if !launch.tokens_deposited {
+            return Err(ContractError::invalid_state("No tokens were deposited"));
+        }
+
+        // Ensure refunds are processed first
+        if !launch.contributions.is_empty() {
+            return Err(ContractError::invalid_state("Refunds must be processed first"));
+        }
+
+        // Return all tokens to creator
+        VftClient::transfer(
+            launch.token_address,
+            launch.creator,
+            U256::from(launch.total_tokens),
+        ).await?;
+
+        // Update state
+        launch.tokens_deposited = false;
+        
+        self.emit_event(LaunchpadEvent::TokensClaimed {
+            launch_id,
+            user: launch.creator,
+            amount: launch.total_tokens,
+        });
+
+        Ok(launch.total_tokens)
     }
 
     // -------------------------------------------------------------------------
@@ -1202,6 +1333,117 @@ impl LaunchpadService {
             .get(&launch_id)
             .map(|l| l.contributors.clone())
             .unwrap_or_default()
+    }
+
+    /// Get contract name.
+    #[export]
+    pub fn get_contract_name(&self) -> &'static str {
+        CONTRACT_NAME
+    }
+
+    /// Get contract version.
+    #[export]
+    pub fn get_contract_version(&self) -> &'static str {
+        CONTRACT_VERSION
+    }
+
+    // -------------------------------------------------------------------------
+    // DEX & BRIDGE COMPATIBILITY
+    // -------------------------------------------------------------------------
+
+    /// Get token metadata for DEX listing.
+    #[export(unwrap_result)]
+    pub async fn get_token_metadata(&self, token_address: ActorId) -> Result<TokenMetadata, ContractError> {
+        VftClient::get_metadata(token_address).await
+    }
+
+    /// Get launch token details for external systems.
+    #[export]
+    pub fn get_launch_token_info(&self, launch_id: Id) -> Option<LaunchTokenInfo> {
+        let launch = storage().launches.get(&launch_id)?;
+        
+        Some(LaunchTokenInfo {
+            token_address: launch.token_address,
+            total_supply: launch.total_tokens,
+            circulating_supply: launch.total_tokens - launch.tokens_remaining,
+            price_per_token: launch.price_per_token,
+            launch_ended: matches!(
+                launch.status, 
+                LaunchStatus::Ended | 
+                LaunchStatus::Succeeded | 
+                LaunchStatus::Failed | 
+                LaunchStatus::Cancelled | 
+                LaunchStatus::Finalized
+            ),
+        })
+    }
+
+    /// Get all token holders and balances for bridge systems.
+    #[export]
+    pub fn get_token_holders(&self, launch_id: Id) -> Vec<TokenHolder> {
+        let launch = match storage().launches.get(&launch_id) {
+            Some(l) => l,
+            None => return Vec::new(),
+        };
+        
+        launch.tokens_purchased
+            .iter()
+            .filter_map(|(holder, amount)| {
+                if *amount > 0 {
+                    Some(TokenHolder {
+                        address: *holder,
+                        balance: *amount,
+                        claimed: launch.claimed.get(holder).copied().unwrap_or(0),
+                    })
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
+
+    /// Return unsold tokens to creator after launch finalization.
+    #[export(unwrap_result)]
+    pub async fn return_unsold_tokens(&mut self, launch_id: Id) -> Result<Amount, ContractError> {
+        let s = storage_mut();
+        let caller = gstd::msg::source();
+
+        let launch = s.launches.get_mut(&launch_id)
+            .ok_or(ContractError::NotFound)?;
+
+        if caller != launch.creator {
+            return Err(ContractError::Unauthorized);
+        }
+
+        // Check if launch has ended and funds were withdrawn
+        if !launch.funds_withdrawn {
+            return Err(ContractError::invalid_state("Must withdraw funds first"));
+        }
+
+        // Check if there are unsold tokens
+        if launch.tokens_remaining == 0 {
+            return Err(ContractError::invalid_state("No unsold tokens to return"));
+        }
+
+        let unsold = launch.tokens_remaining;
+        
+        // Transfer unsold tokens back to creator
+        VftClient::transfer(
+            launch.token_address,
+            caller,
+            U256::from(unsold),
+        ).await?;
+
+        // Update state
+        launch.tokens_remaining = 0;
+
+        self.emit_event(LaunchpadEvent::TokensClaimed {
+            launch_id,
+            user: caller,
+            amount: unsold,
+        });
+
+        Ok(unsold)
     }
 }
 

@@ -1,7 +1,7 @@
 //! Integration tests for Launchpad v2 contract.
 
 use gtest::{Program, System};
-use launchpad_app::CreateLaunchInput;
+use launchpad_app::{CreateLaunchInput, CONTRACT_NAME, CONTRACT_VERSION};
 use sails_rs::prelude::ActorId;
 use sails_rs::Encode;
 
@@ -71,6 +71,9 @@ fn deploy_contract(system: &System) -> Program<'_> {
         panic!("Contract init failed. Check WASM file exists and is valid.");
     }
 
+    // Note: In production, owner would need to call set_vft_code_id()
+    // before creating launches. Tests mock this behavior.
+
     program
 }
 
@@ -79,9 +82,13 @@ fn create_test_launch_input(system: &System) -> CreateLaunchInput {
     let current_block = system.block_height();
 
     CreateLaunchInput {
+        // Token creation parameters
+        token_name: "Test Token".into(),
+        token_symbol: "TEST".into(),
+        
+        // Launch parameters
         title: "Test Token Launch".into(),
         description: "A test token launch for integration testing".into(),
-        token_address: ActorId::from(TOKEN_ADDRESS),
         total_tokens: 1_000_000 * ONE_VARA,
         price_per_token: ONE_VARA / 1000, // 0.001 VARA per token
         min_raise: 100 * ONE_VARA,

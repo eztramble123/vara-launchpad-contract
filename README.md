@@ -6,6 +6,7 @@ A production-ready token launchpad smart contract for the [Vara Network](https:/
 
 This contract enables project creators to conduct fair token sales on Vara Network with:
 
+- **Token Factory**: Automatic VFT token deployment (Pump.fun style)
 - **Clean State Machine**: Well-defined lifecycle states with proper transitions
 - **Whitelist Support**: Optional address-based access control
 - **Contribution Limits**: Per-wallet caps with automatic excess refunds
@@ -13,6 +14,7 @@ This contract enables project creators to conduct fair token sales on Vara Netwo
 - **Vesting Support**: Linear vesting with cliff periods for token distribution
 - **Platform Fees**: Configurable fee on successful launches (default 2%)
 - **Pause/Resume**: Emergency controls for contract owner
+- **VFT Integration**: Full compatibility with Vara's token standard
 
 ## Quick Start
 
@@ -116,9 +118,13 @@ Pending ────────────► Active
 
 ```rust
 pub struct CreateLaunchInput {
+    // Token creation parameters
+    pub token_name: String,        // Name of the token to deploy
+    pub token_symbol: String,      // Symbol of the token
+    
+    // Launch parameters
     pub title: String,
     pub description: String,
-    pub token_address: ActorId,
     pub total_tokens: Amount,
     pub price_per_token: Amount,
     pub min_raise: Amount,        // Soft cap
@@ -162,9 +168,13 @@ pub struct CreateLaunchInput {
 
 ```rust
 let input = CreateLaunchInput {
+    // Token parameters
+    token_name: "My Token".into(),
+    token_symbol: "MTK".into(),
+    
+    // Launch parameters
     title: "My Token Sale".into(),
     description: "Fair launch of MyToken".into(),
-    token_address: my_token_contract,
     total_tokens: 1_000_000 * ONE_TOKEN,
     price_per_token: ONE_VARA / 100,  // 0.01 VARA per token
     min_raise: 500 * ONE_VARA,         // Soft cap
@@ -267,9 +277,17 @@ vara-launchpad-contract/
    - `New` - Default 2% platform fee
    - `NewWithFee(fee_basis_points)` - Custom fee (100 = 1%)
 
+4. Set VFT Code ID (owner only):
+   ```javascript
+   // Use Gear's standard VFT code ID
+   const VFT_CODE_ID = "0x81663df58f48684923777cd8cf281bfd2e4ee427926abc52a1fcf4ecd41be7ad";
+   await launchpad.setVftCodeId(VFT_CODE_ID);
+   ```
+
 ## Documentation
 
 - [Deployment Guide](./docs/deployment-guide.md) - Deployment instructions
+- [VFT Integration Guide](./docs/vft-integration.md) - Token factory setup and usage
 - [Security Checklist](./docs/security-checklist.md) - Security considerations
 - [Integration Patterns](./docs/integration-patterns.md) - Integration examples
 - [Contract README](./contracts/launchpad/README.md) - Detailed contract docs
