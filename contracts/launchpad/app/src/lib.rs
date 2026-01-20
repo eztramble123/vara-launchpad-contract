@@ -118,6 +118,8 @@ pub struct Launch {
     pub refunds_processed: bool,
     /// Contributors list for batch operations.
     pub contributors: Vec<ActorId>,
+    /// Deadline for finalization (end_time + grace period). After this, admin can force refunds.
+    pub finalization_deadline: BlockNumber,
 }
 
 impl Launch {
@@ -206,6 +208,8 @@ pub struct LaunchpadStorage {
     vft_code_id: CodeId,
     /// Reentrancy guard to prevent recursive calls.
     reentrancy_guard: bool,
+    /// Fee recipient address (defaults to owner).
+    fee_recipient: ActorId,
 }
 
 fn storage_mut() -> &'static mut LaunchpadStorage {
@@ -229,6 +233,8 @@ fn init_storage(owner: ActorId, fee_basis_points: u16) {
     // Default to Gear's standard VFT code ID
     // This can be updated via set_vft_code_id() after deployment
     s.vft_code_id = CodeId::default();
+    // Fee recipient defaults to owner
+    s.fee_recipient = owner;
 }
 
 // =============================================================================
@@ -429,9 +435,30 @@ pub enum LaunchpadEvent {
         launch_id: Id,
     },
     /// Contract paused.
-    Paused,
+    Paused {
+        by: ActorId,
+    },
     /// Contract resumed.
-    Resumed,
+    Resumed {
+        by: ActorId,
+    },
+    /// Fee recipient updated.
+    FeeRecipientUpdated {
+        old: ActorId,
+        new: ActorId,
+    },
+    /// Admin forced refund for stuck contribution.
+    AdminForceRefund {
+        launch_id: Id,
+        user: ActorId,
+        amount: Amount,
+    },
+    /// Rescued tokens accidentally sent to contract.
+    TokensRescued {
+        token_address: ActorId,
+        amount: U256,
+        to: ActorId,
+    },
 }
 
 // Implement SailsEvent trait for event emission
@@ -456,8 +483,11 @@ impl sails_rs::SailsEvent for LaunchpadEvent {
             LaunchpadEvent::WhitelistUpdated { .. } => b"WhitelistUpdated",
             LaunchpadEvent::TokensDeposited { .. } => b"TokensDeposited",
             LaunchpadEvent::LaunchFinalized { .. } => b"LaunchFinalized",
-            LaunchpadEvent::Paused => b"Paused",
-            LaunchpadEvent::Resumed => b"Resumed",
+            LaunchpadEvent::Paused { .. } => b"Paused",
+            LaunchpadEvent::Resumed { .. } => b"Resumed",
+            LaunchpadEvent::FeeRecipientUpdated { .. } => b"FeeRecipientUpdated",
+            LaunchpadEvent::AdminForceRefund { .. } => b"AdminForceRefund",
+            LaunchpadEvent::TokensRescued { .. } => b"TokensRescued",
         }
     }
 }
@@ -469,6 +499,10 @@ impl sails_rs::SailsEvent for LaunchpadEvent {
 /// Contract name and version.
 pub const CONTRACT_NAME: &str = "Vara Token Launchpad";
 pub const CONTRACT_VERSION: &str = "1.0.0";
+
+/// Finalization grace period in blocks (approximately 30 days at 1 block/sec).
+/// After end_time + FINALIZATION_GRACE_PERIOD, admin can force refunds for stuck launches.
+pub const FINALIZATION_GRACE_PERIOD: BlockNumber = 2_592_000;
 
 // =============================================================================
 // SERVICE IMPLEMENTATION
@@ -500,7 +534,7 @@ impl LaunchpadService {
         }
 
         s.paused = true;
-        self.emit_event(LaunchpadEvent::Paused);
+        let _ = self.emit_event(LaunchpadEvent::Paused { by: caller });
         Ok(())
     }
 
@@ -515,7 +549,7 @@ impl LaunchpadService {
         }
 
         s.paused = false;
-        self.emit_event(LaunchpadEvent::Resumed);
+        let _ = self.emit_event(LaunchpadEvent::Resumed { by: caller });
         Ok(())
     }
 
@@ -529,7 +563,38 @@ impl LaunchpadService {
             return Err(ContractError::Unauthorized);
         }
 
+        // Validate code ID is not zero/default
+        if code_id == CodeId::default() {
+            return Err(ContractError::invalid_input("Invalid VFT code ID"));
+        }
+
         s.vft_code_id = code_id;
+        Ok(())
+    }
+
+    /// Set the fee recipient address (owner only).
+    #[export(unwrap_result)]
+    pub fn set_fee_recipient(&mut self, recipient: ActorId) -> Result<(), ContractError> {
+        let caller = gstd::msg::source();
+        let s = storage_mut();
+
+        if caller != s.owner {
+            return Err(ContractError::Unauthorized);
+        }
+
+        // Validate recipient is not zero address
+        if recipient == ActorId::default() {
+            return Err(ContractError::ZeroAddress);
+        }
+
+        let old = s.fee_recipient;
+        s.fee_recipient = recipient;
+
+        let _ = self.emit_event(LaunchpadEvent::FeeRecipientUpdated {
+            old,
+            new: recipient,
+        });
+
         Ok(())
     }
 
@@ -586,6 +651,13 @@ impl LaunchpadService {
             return Err(ContractError::invalid_input("Max raise exceeds token value"));
         }
 
+        // Validate vesting configuration if provided
+        if let Some(ref vesting) = input.vesting_config {
+            if vesting.vesting_end() < input.end_time {
+                return Err(ContractError::invalid_input("Vesting must end after launch ends"));
+            }
+        }
+
         // Check if VFT code ID is set
         if s.vft_code_id == CodeId::default() {
             return Err(ContractError::invalid_state("VFT code ID not set"));
@@ -631,6 +703,7 @@ impl LaunchpadService {
             funds_withdrawn: false,
             refunds_processed: false,
             contributors: Vec::new(),
+            finalization_deadline: input.end_time.saturating_add(FINALIZATION_GRACE_PERIOD),
         };
 
         s.launches.insert(launch_id, launch);
@@ -668,9 +741,9 @@ impl LaunchpadService {
             return Err(ContractError::Unauthorized);
         }
 
-        // Can only modify whitelist before launch ends
-        if !matches!(launch.status, LaunchStatus::Pending | LaunchStatus::Active) {
-            return Err(ContractError::invalid_state("Cannot modify whitelist after launch ends"));
+        // Can only modify whitelist before launch starts (Pending status only)
+        if launch.status != LaunchStatus::Pending {
+            return Err(ContractError::invalid_state("Cannot modify whitelist after launch starts"));
         }
 
         let count = addresses.len() as u32;
@@ -903,6 +976,11 @@ impl LaunchpadService {
         let launch = s.launches.get_mut(&launch_id)
             .ok_or(ContractError::NotFound)?;
 
+        // Idempotency check - prevent re-cancellation of already processed launches
+        if matches!(launch.status, LaunchStatus::Cancelled | LaunchStatus::RefundAvailable | LaunchStatus::Finalized) {
+            return Err(ContractError::AlreadyProcessed);
+        }
+
         // Authorization check
         let is_creator = caller == launch.creator;
         let is_owner = caller == s.owner;
@@ -915,11 +993,6 @@ impl LaunchpadService {
         // Owner can cancel any time (emergency)
         if is_creator && launch.status != LaunchStatus::Pending {
             return Err(ContractError::invalid_state("Creator can only cancel pending launches"));
-        }
-
-        // Can't cancel finalized launches
-        if launch.status == LaunchStatus::Finalized {
-            return Err(ContractError::invalid_state("Launch already finalized"));
         }
 
         launch.status = LaunchStatus::Cancelled;
@@ -1063,6 +1136,58 @@ impl LaunchpadService {
         Ok(contribution)
     }
 
+    /// Admin force refund for stuck contributions (owner only, after finalization deadline).
+    /// This allows the admin to refund stuck user contributions when the creator disappears.
+    #[export(unwrap_result)]
+    pub fn admin_force_refund(&mut self, launch_id: Id, user: ActorId) -> Result<Amount, ContractError> {
+        let s = storage_mut();
+        let caller = gstd::msg::source();
+        let current_block = gstd::exec::block_height();
+
+        if caller != s.owner {
+            return Err(ContractError::Unauthorized);
+        }
+
+        let launch = s.launches.get_mut(&launch_id)
+            .ok_or(ContractError::NotFound)?;
+
+        // Only works if finalization deadline has passed
+        if current_block <= launch.finalization_deadline {
+            return Err(ContractError::DeadlineNotPassed);
+        }
+
+        // Only works for refundable states
+        if !matches!(launch.status, LaunchStatus::RefundAvailable | LaunchStatus::Failed | LaunchStatus::Cancelled) {
+            return Err(ContractError::invalid_state("Launch is not in refundable state"));
+        }
+
+        // Get contribution
+        let contribution = launch.contributions.remove(&user)
+            .ok_or(ContractError::invalid_state("No contribution to refund for this user"))?;
+
+        if contribution == 0 {
+            return Err(ContractError::ZeroAmount);
+        }
+
+        // Transfer refund to user
+        transfer_native(user, contribution)?;
+
+        let _ = self.emit_event(LaunchpadEvent::AdminForceRefund {
+            launch_id,
+            user,
+            amount: contribution,
+        });
+
+        // Check if all refunds processed
+        if launch.contributions.is_empty() {
+            launch.refunds_processed = true;
+            launch.status = LaunchStatus::Finalized;
+            let _ = self.emit_event(LaunchpadEvent::LaunchFinalized { launch_id });
+        }
+
+        Ok(contribution)
+    }
+
     /// Return all deposited tokens to creator when launch fails.
     #[export(unwrap_result)]
     pub async fn return_tokens_on_failure(&mut self, launch_id: Id) -> Result<Amount, ContractError> {
@@ -1164,7 +1289,7 @@ impl LaunchpadService {
         Ok(amount_to_creator)
     }
 
-    /// Withdraw accumulated platform fees (owner only).
+    /// Withdraw accumulated platform fees (owner only, sent to fee_recipient).
     #[export(unwrap_result)]
     pub fn withdraw_fees(&mut self) -> Result<Amount, ContractError> {
         let s = storage_mut();
@@ -1181,17 +1306,55 @@ impl LaunchpadService {
 
         // Update state first
         s.fees_withdrawn = s.fees_withdrawn.saturating_add(available);
+        let recipient = s.fee_recipient;
 
-        // Transfer
-        transfer_native(caller, available)?;
+        // Transfer to fee recipient (may differ from owner)
+        transfer_native(recipient, available)?;
 
         self.emit_event(LaunchpadEvent::FeesWithdrawn {
-            owner: caller,
+            owner: recipient,
             amount: available,
             total_accumulated: s.accumulated_fees,
         });
 
         Ok(available)
+    }
+
+    /// Rescue tokens accidentally sent to contract (owner only).
+    /// Cannot rescue sale tokens from any launch.
+    #[export(unwrap_result)]
+    pub async fn rescue_tokens(&mut self, token_address: ActorId, amount: U256) -> Result<(), ContractError> {
+        let _guard = ReentrancyGuard::start()?;
+
+        let s = storage_mut();
+        let caller = gstd::msg::source();
+
+        if caller != s.owner {
+            return Err(ContractError::Unauthorized);
+        }
+
+        if amount == 0 {
+            return Err(ContractError::ZeroAmount);
+        }
+
+        // Ensure the token is not from any active launch
+        for launch in s.launches.values() {
+            if launch.token_address == token_address {
+                return Err(ContractError::invalid_state("Cannot rescue sale tokens"));
+            }
+        }
+
+        // Transfer tokens to fee recipient
+        let recipient = s.fee_recipient;
+        VftClient::transfer(token_address, recipient, amount).await?;
+
+        let _ = self.emit_event(LaunchpadEvent::TokensRescued {
+            token_address,
+            amount,
+            to: recipient,
+        });
+
+        Ok(())
     }
 
     // -------------------------------------------------------------------------
@@ -1289,6 +1452,12 @@ impl LaunchpadService {
     #[export]
     pub fn get_owner(&self) -> ActorId {
         storage().owner
+    }
+
+    /// Get fee recipient address.
+    #[export]
+    pub fn get_fee_recipient(&self) -> ActorId {
+        storage().fee_recipient
     }
 
     /// Check if contract is paused.

@@ -34,14 +34,24 @@ pub struct CreateLaunchInput {
 - CEI pattern enforcement
 - Input validation on all parameters
 - Automatic refunds for excess contributions
+- Vesting time validation (must end after launch)
+- VFT code ID validation (prevents zero/default)
+- Whitelist locked after launch starts
+- Cancel idempotency protection
 
-### 5. **Documentation Complete**
+### 5. **Admin & Emergency Functions**
+- Separate fee recipient address (configurable)
+- Admin force refund (time-locked, 30 days after end)
+- Rescue tokens (for accidentally sent tokens, NOT sale tokens)
+- Enhanced pause/resume events with caller tracking
+
+### 6. **Documentation Complete**
 - **README.md**: Updated with new API structure
 - **VFT Integration Guide**: Complete setup instructions
 - **Deployment Guide**: Step-by-step deployment process
 - **Security Checklist**: Production security considerations
 
-### 6. **Test Suite Updated**
+### 7. **Test Suite Updated**
 - Tests updated for new token factory flow
 - Proper mocking of VFT deployments
 - Integration test coverage maintained
@@ -107,11 +117,25 @@ await launchpad.claimTokens(launchId);
 - Role-based permissions (owner, creator, users)
 - State machine prevents invalid transitions
 - Pause mechanism for emergencies
+- Whitelist locked once launch starts
+
+### Admin Emergency Functions
+- `set_fee_recipient()`: Separate fee collection from owner
+- `admin_force_refund()`: Time-locked (30 days) for stuck contributions
+- `rescue_tokens()`: Recover accidentally sent tokens (NOT sale tokens)
+- Enhanced events include caller info for audit trail
 
 ### Error Handling
 - Comprehensive error types
 - State rollback on failures
 - Detailed error messages for debugging
+
+### Fee Calculation Notes
+Platform fees use `checked_div` which rounds down. For example:
+- 100 VARA raised with 2% fee (200 basis points): fee = 100 * 200 / 10000 = 2 VARA
+- 99 VARA raised with 2% fee: fee = 99 * 200 / 10000 = 1 VARA (rounds down)
+
+This behavior favors creators slightly on small amounts.
 
 ## 📊 Gas Optimization
 

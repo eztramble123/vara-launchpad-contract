@@ -25,8 +25,8 @@ The contract uses safe arithmetic throughout:
 ### Access Control
 
 - [x] Caller identity verified with `gstd::msg::source()`
-- [x] Creator-only operations: `start_launch`, `withdraw_funds`, `cancel_launch`
-- [x] Owner-only operations: `pause`, `resume`, `withdraw_fees`
+- [x] Creator-only operations: `start_launch`, `withdraw_funds`, `cancel_launch` (pending only)
+- [x] Owner-only operations: `pause`, `resume`, `withdraw_fees`, `set_fee_recipient`, `set_vft_code_id`, `admin_force_refund`, `rescue_tokens`
 - [x] Anyone can call: `finalize`, `claim_tokens`, `claim_refund`
 
 ### Input Validation
@@ -38,6 +38,8 @@ The contract uses safe arithmetic throughout:
 - [x] Start time must be before end time
 - [x] Min raise <= max raise
 - [x] Max raise <= total_tokens * price_per_token
+- [x] Vesting end time must be after launch end time
+- [x] VFT code ID cannot be set to zero/default
 
 ## Contract-Specific Checklist
 
@@ -49,6 +51,8 @@ The contract uses safe arithmetic throughout:
 - [x] `Active` → `Ended` when time expires or fully subscribed
 - [x] `Ended` → `Succeeded` or `Failed` based on min_raise
 - [x] `Cancelled` only allowed for `Pending` (by creator) or any state (by owner)
+- [x] Cancel idempotency: cannot re-cancel already cancelled/finalized launches
+- [x] Whitelist locked once launch starts (cannot modify during Active status)
 
 ### Contribution Logic
 
@@ -75,6 +79,13 @@ The contract uses safe arithmetic throughout:
 - [x] Contribution removed on refund (prevents double-claim)
 - [x] All contributors can be enumerated
 - [x] Refund transfers use safe native transfer
+
+### Emergency & Admin Functions
+
+- [x] `admin_force_refund`: Time-locked (30 days after end_time) for stuck contributions
+- [x] `rescue_tokens`: Can rescue tokens accidentally sent to contract (NOT sale tokens)
+- [x] `set_fee_recipient`: Allows separation of fee collection from owner
+- [x] Fee recipient validated (cannot be zero address)
 
 ### Token Claims
 
@@ -184,7 +195,11 @@ Monitor these events for anomalies:
 | `Contributed` | Large contributions |
 | `LaunchFailed` | Unexpected failures |
 | `FundsWithdrawn` | Verify amounts match expectations |
-| `Paused` | Emergency activation |
+| `Paused` | Emergency activation (includes caller info) |
+| `Resumed` | Recovery confirmation (includes caller info) |
+| `FeeRecipientUpdated` | Admin action (old/new addresses) |
+| `AdminForceRefund` | Emergency refund action |
+| `TokensRescued` | Token recovery action |
 
 ### State Monitoring
 
