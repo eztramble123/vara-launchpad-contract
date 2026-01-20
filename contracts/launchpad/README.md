@@ -74,9 +74,13 @@ pub enum LaunchStatus {
 
 ```rust
 pub struct CreateLaunchInput {
+    // Token creation parameters
+    pub token_name: String,        // Max 64 characters
+    pub token_symbol: String,      // Max 10 characters
+
+    // Launch parameters
     pub title: String,
     pub description: String,
-    pub token_address: ActorId,
     pub total_tokens: Amount,
     pub price_per_token: Amount,
     pub min_raise: Amount,
@@ -106,16 +110,31 @@ pub struct CreateLaunchInput {
 
 ```rust
 pub enum LaunchpadEvent {
-    LaunchCreated { launch_id, creator, token_address, total_tokens },
+    LaunchCreated { launch_id, creator, token_address, total_tokens, ... },
     LaunchStarted { launch_id },
-    Contributed { launch_id, contributor, amount, tokens_purchased },
-    TokensClaimed { launch_id, claimer, amount },
-    RefundClaimed { launch_id, contributor, amount },
-    FundsWithdrawn { launch_id, amount },
+    TokenDeployed { launch_id, token_address, name, symbol, total_supply },
+    Contributed { launch_id, contributor, amount, tokens_purchased, refunded },
+    TokensClaimed { launch_id, user, amount },
+    RefundClaimed { launch_id, user, amount },
+    FundsWithdrawn { launch_id, creator, amount, fee },
     LaunchSucceeded { launch_id, total_raised },
-    LaunchFailed { launch_id },
-    LaunchCancelled { launch_id },
+    LaunchFailed { launch_id, total_raised, min_raise },
+    LaunchCancelled { launch_id, by },
     WhitelistUpdated { launch_id, addresses_added },
+    SaleEnded { launch_id, total_raised, total_contributors, reason },
+    SaleFullySubscribed { launch_id, total_raised },
+    DistributionPending { launch_id },
+    RefundsAvailable { launch_id, total_to_refund, num_contributors },
+    TokenTransferFailed { launch_id, user, amount, reason },
+    FeesWithdrawn { owner, amount, total_accumulated },
+    TokensDeposited { launch_id, amount },
+    LaunchFinalized { launch_id },
+    Paused { by },
+    Resumed { by },
+    FeeRecipientUpdated { old, new },
+    GasConfigUpdated { gas_for_program, gas_for_reply },
+    AdminForceRefund { launch_id, user, amount },
+    TokensRescued { token_address, amount, to },
 }
 ```
 

@@ -4,10 +4,10 @@
 //! for fair token launches.
 
 use alloc::string::String;
-use alloc::vec::Vec;
 use parity_scale_codec::{Decode, Encode};
 use scale_info::TypeInfo;
 use sails_rs::prelude::*;
+use gstd::prog::ProgramGenerator;
 use vara_contracts_shared::{ContractError};
 use crate::vft_client::U256;
 
@@ -28,20 +28,23 @@ pub struct VftFactory;
 
 impl VftFactory {
     /// Deploy a new VFT token contract.
-    /// 
+    ///
     /// This deploys a standard VFT token with:
     /// - Fixed total supply minted to the launchpad
     /// - Standard 18 decimals
     /// - Transfer/approval capabilities
+    /// - Configurable gas for program creation and reply handling
     pub async fn deploy_token(
         name: String,
         symbol: String,
         total_supply: U256,
-        code_id: CodeId,  // Code ID of uploaded VFT contract code
+        code_id: CodeId,
+        gas_for_program: u64,
+        gas_for_reply: u64,
     ) -> Result<ActorId, ContractError> {
         // Get launchpad's address (tokens will be minted here)
         let launchpad_address = gstd::exec::program_id();
-        
+
         // Prepare initialization parameters
         let init_params = VftInitParams {
             name,
@@ -50,28 +53,27 @@ impl VftFactory {
             total_supply,
             initial_owner: launchpad_address,  // Mint all tokens to launchpad
         };
-        
+
         // Encode init params
         let payload = init_params.encode();
-        
-        // Deploy the token contract
-        // Note: In production, you'd use gstd::prog::create_program_with_gas
-        // to deploy from code_id with the init payload
-        let (message_id, token_address) = gstd::prog::create_program_with_gas(
+
+        // Deploy the token contract using ProgramGenerator with configurable gas
+        // ProgramGenerator handles salt generation automatically
+        let (_, token_address) = ProgramGenerator::create_program_bytes_with_gas(
             code_id,
             payload,
+            gas_for_program,
             0,  // No value transfer
-            10_000_000_000,  // Gas for deployment
-            0,  // No reply deposit
         )
         .map_err(|_| ContractError::invalid_state("Failed to deploy token"))?;
-        
-        // Wait for deployment confirmation
-        gstd::msg::send_bytes_for_reply(token_address, b"ping", 0, 0)
+
+        // Send a ping to verify the program is ready and wait for reply
+        // using the configured reply gas
+        gstd::msg::send_bytes_with_gas_for_reply(token_address, b"", gas_for_reply, 0, 0)
             .map_err(|_| ContractError::TransferFailed)?
             .await
-            .map_err(|_| ContractError::invalid_state("Token deployment confirmation failed"))?;
-        
+            .map_err(|_| ContractError::invalid_state("Token deployment verification failed"))?;
+
         Ok(token_address)
     }
     
@@ -82,9 +84,11 @@ impl VftFactory {
         total_supply: U256,
         decimals: u8,
         code_id: CodeId,
+        gas_for_program: u64,
+        gas_for_reply: u64,
     ) -> Result<ActorId, ContractError> {
         let launchpad_address = gstd::exec::program_id();
-        
+
         let init_params = VftInitParams {
             name,
             symbol,
@@ -92,24 +96,26 @@ impl VftFactory {
             total_supply,
             initial_owner: launchpad_address,
         };
-        
+
         let payload = init_params.encode();
-        
-        let (message_id, token_address) = gstd::prog::create_program_with_gas(
+
+        // Deploy using ProgramGenerator with configurable gas
+        // ProgramGenerator handles salt generation automatically
+        let (_, token_address) = ProgramGenerator::create_program_bytes_with_gas(
             code_id,
             payload,
-            0,
-            10_000_000_000,
+            gas_for_program,
             0,
         )
         .map_err(|_| ContractError::invalid_state("Failed to deploy token"))?;
-        
-        // Verify deployment
-        gstd::msg::send_bytes_for_reply(token_address, b"ping", 0, 0)
+
+        // Send a ping to verify the program is ready and wait for reply
+        // using the configured reply gas
+        gstd::msg::send_bytes_with_gas_for_reply(token_address, b"", gas_for_reply, 0, 0)
             .map_err(|_| ContractError::TransferFailed)?
             .await
-            .map_err(|_| ContractError::invalid_state("Token deployment confirmation failed"))?;
-        
+            .map_err(|_| ContractError::invalid_state("Token deployment verification failed"))?;
+
         Ok(token_address)
     }
 }

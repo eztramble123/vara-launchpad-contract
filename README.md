@@ -95,6 +95,16 @@ Pending ────────────► Active
 | `pause` | - | Pause contract (owner) |
 | `resume` | - | Resume contract (owner) |
 
+### Admin Functions (Owner Only)
+
+| Method | Parameters | Description |
+|--------|------------|-------------|
+| `set_vft_code_id` | `code_id` | Set VFT token code ID for deployment |
+| `set_fee_recipient` | `recipient` | Set fee recipient address |
+| `set_gas_config` | `gas_for_program, gas_for_reply` | Configure gas for token deployment |
+| `admin_force_refund` | `launch_id, user` | Force refund for stuck contributions (after grace period) |
+| `rescue_tokens` | `token_address, amount` | Rescue tokens accidentally sent to contract |
+
 ### Queries (Read-Only)
 
 | Method | Parameters | Returns |
@@ -112,6 +122,8 @@ Pending ────────────► Active
 | `get_accumulated_fees` | - | `Amount` |
 | `get_available_fees` | - | `Amount` |
 | `get_owner` | - | `ActorId` |
+| `get_fee_recipient` | - | `ActorId` |
+| `get_gas_config` | - | `(u64, u64)` |
 | `is_paused` | - | `bool` |
 
 ### CreateLaunchInput
@@ -119,9 +131,9 @@ Pending ────────────► Active
 ```rust
 pub struct CreateLaunchInput {
     // Token creation parameters
-    pub token_name: String,        // Name of the token to deploy
-    pub token_symbol: String,      // Symbol of the token
-    
+    pub token_name: String,        // Name of the token (max 64 chars)
+    pub token_symbol: String,      // Symbol of the token (max 10 chars)
+
     // Launch parameters
     pub title: String,
     pub description: String,
@@ -143,6 +155,7 @@ pub struct CreateLaunchInput {
 |-------|-------------|
 | `LaunchCreated` | New launch created with full parameters |
 | `LaunchStarted` | Launch activated |
+| `TokenDeployed` | New VFT token deployed via factory |
 | `SaleEnded` | Sale period ended (time/fully subscribed) |
 | `SaleFullySubscribed` | Hard cap reached |
 | `LaunchSucceeded` | Soft cap met |
@@ -161,6 +174,10 @@ pub struct CreateLaunchInput {
 | `LaunchFinalized` | All operations complete |
 | `Paused` | Contract paused |
 | `Resumed` | Contract resumed |
+| `FeeRecipientUpdated` | Fee recipient address changed |
+| `GasConfigUpdated` | Gas configuration changed |
+| `AdminForceRefund` | Admin forced a refund for stuck contribution |
+| `TokensRescued` | Tokens rescued from contract |
 
 ## Usage Examples
 

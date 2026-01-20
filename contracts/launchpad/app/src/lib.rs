@@ -22,7 +22,7 @@ use vara_contracts_shared::{Amount, BlockNumber, ContractError, Id, VestingConfi
 mod vft_client;
 mod vft_factory;
 use vft_client::{VftClient, TokenMetadata, TokenHolder, LaunchTokenInfo, U256};
-use vft_factory::{VftFactory, TokenConfig};
+use vft_factory::VftFactory;
 
 // =============================================================================
 // STATE MACHINE
@@ -210,6 +210,10 @@ pub struct LaunchpadStorage {
     reentrancy_guard: bool,
     /// Fee recipient address (defaults to owner).
     fee_recipient: ActorId,
+    /// Gas allocated for program creation.
+    gas_for_program: u64,
+    /// Gas allocated for reply handling.
+    gas_for_reply: u64,
 }
 
 fn storage_mut() -> &'static mut LaunchpadStorage {
@@ -235,6 +239,9 @@ fn init_storage(owner: ActorId, fee_basis_points: u16) {
     s.vft_code_id = CodeId::default();
     // Fee recipient defaults to owner
     s.fee_recipient = owner;
+    // Default gas values for program creation
+    s.gas_for_program = 10_000_000_000;  // 10 billion
+    s.gas_for_reply = 5_000_000_000;     // 5 billion
 }
 
 // =============================================================================
@@ -459,6 +466,19 @@ pub enum LaunchpadEvent {
         amount: U256,
         to: ActorId,
     },
+    /// New token deployed via the factory.
+    TokenDeployed {
+        launch_id: Id,
+        token_address: ActorId,
+        name: String,
+        symbol: String,
+        total_supply: Amount,
+    },
+    /// Gas configuration updated.
+    GasConfigUpdated {
+        gas_for_program: u64,
+        gas_for_reply: u64,
+    },
 }
 
 // Implement SailsEvent trait for event emission
@@ -488,6 +508,8 @@ impl sails_rs::SailsEvent for LaunchpadEvent {
             LaunchpadEvent::FeeRecipientUpdated { .. } => b"FeeRecipientUpdated",
             LaunchpadEvent::AdminForceRefund { .. } => b"AdminForceRefund",
             LaunchpadEvent::TokensRescued { .. } => b"TokensRescued",
+            LaunchpadEvent::TokenDeployed { .. } => b"TokenDeployed",
+            LaunchpadEvent::GasConfigUpdated { .. } => b"GasConfigUpdated",
         }
     }
 }
@@ -598,6 +620,35 @@ impl LaunchpadService {
         Ok(())
     }
 
+    /// Set gas configuration for program deployment (owner only).
+    #[export(unwrap_result)]
+    pub fn set_gas_config(&mut self, gas_for_program: u64, gas_for_reply: u64) -> Result<(), ContractError> {
+        let caller = gstd::msg::source();
+        let s = storage_mut();
+
+        if caller != s.owner {
+            return Err(ContractError::Unauthorized);
+        }
+
+        // Validate gas values are reasonable (minimum 1 billion)
+        if gas_for_program < 1_000_000_000 {
+            return Err(ContractError::invalid_input("Gas for program too low (min 1 billion)"));
+        }
+        if gas_for_reply < 1_000_000_000 {
+            return Err(ContractError::invalid_input("Gas for reply too low (min 1 billion)"));
+        }
+
+        s.gas_for_program = gas_for_program;
+        s.gas_for_reply = gas_for_reply;
+
+        let _ = self.emit_event(LaunchpadEvent::GasConfigUpdated {
+            gas_for_program,
+            gas_for_reply,
+        });
+
+        Ok(())
+    }
+
     // -------------------------------------------------------------------------
     // LAUNCH CREATION
     // -------------------------------------------------------------------------
@@ -620,8 +671,14 @@ impl LaunchpadService {
         if input.token_name.is_empty() {
             return Err(ContractError::invalid_input("Token name cannot be empty"));
         }
+        if input.token_name.len() > 64 {
+            return Err(ContractError::invalid_input("Token name too long (max 64 chars)"));
+        }
         if input.token_symbol.is_empty() {
             return Err(ContractError::invalid_input("Token symbol cannot be empty"));
+        }
+        if input.token_symbol.len() > 10 {
+            return Err(ContractError::invalid_input("Token symbol too long (max 10 chars)"));
         }
         if input.title.is_empty() {
             return Err(ContractError::invalid_input("Title cannot be empty"));
@@ -663,12 +720,18 @@ impl LaunchpadService {
             return Err(ContractError::invalid_state("VFT code ID not set"));
         }
 
-        // Deploy the token contract
+        // Get gas configuration
+        let gas_for_program = s.gas_for_program;
+        let gas_for_reply = s.gas_for_reply;
+
+        // Deploy the token contract with configurable gas
         let token_address = VftFactory::deploy_token(
             input.token_name.clone(),
             input.token_symbol.clone(),
             U256::from(input.total_tokens),
             s.vft_code_id,
+            gas_for_program,
+            gas_for_reply,
         ).await?;
 
         let launch_id = s.next_launch_id;
@@ -707,6 +770,15 @@ impl LaunchpadService {
         };
 
         s.launches.insert(launch_id, launch);
+
+        // Emit TokenDeployed event for the newly created token
+        let _ = self.emit_event(LaunchpadEvent::TokenDeployed {
+            launch_id,
+            token_address,
+            name: input.token_name,
+            symbol: input.token_symbol,
+            total_supply: input.total_tokens,
+        });
 
         let _ = self.emit_event(LaunchpadEvent::LaunchCreated {
             launch_id,
@@ -1464,6 +1536,13 @@ impl LaunchpadService {
     #[export]
     pub fn is_paused(&self) -> bool {
         storage().paused
+    }
+
+    /// Get gas configuration for program deployment.
+    #[export]
+    pub fn get_gas_config(&self) -> (u64, u64) {
+        let s = storage();
+        (s.gas_for_program, s.gas_for_reply)
     }
 
     /// Get claimable tokens for a user (accounting for vesting).
